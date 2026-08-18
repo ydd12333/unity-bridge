@@ -1,0 +1,24 @@
+{
+  "name": "com.yd.unitybridge",
+  "version": "1.0.0",
+  "displayName": "Unity Bridge",
+  "description": "常驻本地 HTTP 服务（127.0.0.1:8321，端口占用自动顺延），让 DeepSeek Harness（DSH）或任意 HTTP 客户端控制 Unity 编辑器：编译、刷新资产、读取 Console 日志与编译错误、执行编辑器静态方法、打开场景、查询资源，并可透传调用 MCP for Unity 工具。",
+  "unity": "2021.3",
+  "author": {
+    "name": "ydd12333",
+    "url": "https://github.com/your-org/unity-bridge"
+  },
+  "keywords": [
+    "unity",
+    "editor",
+    "http",
+    "bridge",
+    "dsh",
+    "deepseek",
+    "mcp"
+  ],
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.0.2",
+    "com.coplaydev.unity-mcp": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main"
+  }
+}
