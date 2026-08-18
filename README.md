@@ -36,7 +36,7 @@ unity-bridge/
 
 ```powershell
 # 克隆仓库
-git clone https://github.com/<your-org>/unity-bridge.git
+git clone https://github.com/ydd12333/unity-bridge.git
 cd unity-bridge
 
 # 仅安装 DSH preset（Unity 侧稍后单独装）
@@ -49,7 +49,7 @@ cd unity-bridge
 也可以直接从远端一行执行（PowerShell 5+）：
 
 ```powershell
-irm https://raw.githubusercontent.com/<your-org>/unity-bridge/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/ydd12333/unity-bridge/main/install.ps1 | iex
 ```
 
 > 从远端执行时 `-UnityProject` 参数无法传递，只会安装 DSH preset；Unity 包请用下面的方式二。
@@ -59,13 +59,13 @@ irm https://raw.githubusercontent.com/<your-org>/unity-bridge/main/install.ps1 |
 在 Unity 中打开 **Window → Package Manager → + → Add package from git URL…**，粘贴：
 
 ```
-https://github.com/<your-org>/unity-bridge.git?path=/com.yd.unitybridge
+https://github.com/ydd12333/unity-bridge.git?path=/com.yd.unitybridge
 ```
 
 或者直接编辑项目 `Packages/manifest.json` 的 `dependencies` 加一行：
 
 ```json
-"com.yd.unitybridge": "https://github.com/<your-org>/unity-bridge.git?path=/com.yd.unitybridge"
+"com.yd.unitybridge": "https://github.com/ydd12333/unity-bridge.git?path=/com.yd.unitybridge"
 ```
 
 > UPM 包自动依赖 `com.coplaydev.unity-mcp`（MCP for Unity，git 包）与 `com.unity.nuget.newtonsoft-json`，Package Manager 会一并解析。
