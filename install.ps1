@@ -229,6 +229,15 @@ else {
         Write-Host "  插件文件已复制：$pluginDst" -ForegroundColor Green
     }
 
+    # 复制 Unity 侧安装指南（插件会把它注入 systemPrompt 供 AI 读取）
+    $installDocSrc = Join-Path $RepoRoot 'Install.md'
+    $installDocDst = Join-Path $profileDir 'Install.md'
+    if (-not (Test-Path $installDocSrc)) {
+        throw "找不到安装指南：$installDocSrc（请确认在仓库根目录运行本脚本）"
+    }
+    Copy-Item $installDocSrc $installDocDst -Force
+    Write-Host "  安装指南已复制：$installDocDst" -ForegroundColor Green
+
     $patchContent = Get-Content $patchPath -Raw -Encoding UTF8
     if ($patchContent -match [regex]::Escape($PatchEntryId)) {
         Write-Host "  cordis.patch.yml 已包含 $PatchEntryId，跳过写入" -ForegroundColor Green

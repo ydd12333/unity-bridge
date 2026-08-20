@@ -160,6 +160,13 @@ else {
     else {
         Write-Host "  插件文件不存在：$pluginDst（可能已删除）" -ForegroundColor DarkGray
     }
+
+    # 删除随 copy 方式安装的安装指南（若有）
+    $installDocDst = Join-Path $profileDir 'Install.md'
+    if (Test-Path $installDocDst) {
+        Remove-Item $installDocDst -Force
+        Write-Host "  已删除安装指南：$installDocDst" -ForegroundColor Green
+    }
 }
 
 # 1c. 清理旧版 agent preset（如有残留）

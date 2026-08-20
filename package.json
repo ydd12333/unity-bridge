@@ -21,6 +21,7 @@
   "files": [
     "plugin",
     "cordis.patch.yml",
+    "Install.md",
     "README.md"
   ],
   "engines": {

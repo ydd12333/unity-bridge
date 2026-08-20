@@ -17,6 +17,10 @@
 //
 // 作为 host 全局插件，任何 preset、任何会话都可用 unity_* 工具。
 //
+// Unity 侧组件（UPM 包 com.yd.unitybridge）需要单独安装：本插件在
+// systemPrompt 注入 Install.md 的绝对路径（见下方 resolveInstallDoc），
+// AI 会话据此读取安装指南并自动完成 Unity 侧安装。
+//
 // 注意：本文件经包入口加载，内部无法解析 harness 的 @deepseek-ai/dsh-tools，
 // 因此手写完整 ToolDefinition 传给 ctx.tools.register。
 // register 的 parameters 直接投影给模型，必须是完整 JSON Schema。
@@ -24,10 +28,26 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const HOST = '127.0.0.1'
 const DEFAULT_PORT = 8321
 const DEFAULT_TIMEOUT_MS = 30000
+
+// 定位随包分发的 Install.md（Unity 侧安装指南）。两种安装布局都要覆盖：
+//   - pnpm / dsh plugin 安装：<profile>/node_modules/unity-bridge/plugin/unity-bridge.mjs
+//     → Install.md 在本文件上一级（node_modules/unity-bridge/Install.md）
+//   - copy 方式安装：<profile>/unity-bridge.mjs
+//     → Install.md 与本文件同级（<profile>/Install.md）
+// 返回第一个存在者的绝对路径；都不存在（例如仓库内直接运行）则返回 undefined。
+function resolveInstallDoc() {
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    path.join(here, '..', 'Install.md'), // pnpm 布局
+    path.join(here, 'Install.md'),       // copy 布局
+  ]
+  return candidates.find((p) => fs.existsSync(p))
+}
 
 export const name = 'unity-bridge'
 export const inject = ['tools', 'systemPrompt']
@@ -277,6 +297,25 @@ export function apply(ctx) {
     order: 150,
     text: UNITY_BRIDGE_CHEATSHEET,
   })
+
+  // 把 Unity 侧安装指南的位置告诉 AI：安装插件 ≠ 已能连上 Unity，
+  // 目标项目还需安装 UPM 包 com.yd.unitybridge 才会启动本地服务。
+  const installDoc = resolveInstallDoc()
+  if (installDoc) {
+    ctx.systemPrompt.section({
+      name: 'unity-bridge-install-guide',
+      order: 149,
+      text: `# Unity Bridge Unity 侧安装（如未安装）
+
+本插件（DSH 侧）已就绪，但控制 Unity 还需要目标项目安装 Unity 侧组件
+（UPM 包 com.yd.unitybridge）。若 \`unity_health\` 连接失败或报"项目不匹配"，
+请先读取安装指南并按步骤安装/验证：\`${installDoc}\`
+
+要点：把 \`com.yd.unitybridge\`（git URL \`https://github.com/ydd12333/unity-bridge.git?path=/com.yd.unitybridge\`）
+加入目标项目 \`Packages/manifest.json\` 的 \`dependencies\`，等 Unity 解析编译后
+服务自动启动（127.0.0.1:8321）。详见 Install.md。`,
+    })
+  }
 
   register(ctx, 'unity_health',
     '查询 Unity 编辑器状态（是否正在编译/刷新、项目名、Unity 版本、监听端口、项目路径）。',
