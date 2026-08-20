@@ -33,6 +33,32 @@ import { fileURLToPath } from 'node:url'
 const HOST = '127.0.0.1'
 const DEFAULT_PORT = 8321
 const DEFAULT_TIMEOUT_MS = 30000
+// /health 探测用短超时：避免主线程被 Modal 对话框等阻塞时，每次探测都等满默认超时。
+const HEALTH_TIMEOUT_MS = 5000
+// 「黑洞端口」防护：TCP 握手成功但 10s 内无任何响应字节时立即放弃，
+// 避免对不响应实例（主线程卡死/Modal 阻塞/防火墙半开放）空等 timeoutMs（最长 180s）。
+const FIRST_BYTE_TIMEOUT_MS = 10000
+// 编译/刷新轮询上限：默认 120s，可用 UNITY_BRIDGE_COMPILE_TIMEOUT_MS 覆盖
+//（大项目首次编译/首次 git 包拉取可能 >2 分钟，见 Install.md §3）。
+const DEFAULT_COMPILE_TIMEOUT_MS = 120000
+function compileTimeoutMs() {
+  const v = Number(process.env.UNITY_BRIDGE_COMPILE_TIMEOUT_MS)
+  return Number.isInteger(v) && v > 0 ? v : DEFAULT_COMPILE_TIMEOUT_MS
+}
+
+// 编译/刷新互斥锁：防止模型并发调用 unity_compile/unity_refresh 时产生双份
+// 「触发 + 轮询」——后到的调用直接报告"已有编译任务进行中"，不再重复触发与轮询，
+// 避免两个调用各自空等同一段编译时间。
+let compileLock = null
+function withCompileLock(fn) {
+  if (compileLock) {
+    return Promise.resolve({ skipped: true, reason: '已有编译/刷新任务进行中（另一调用正在轮询）。请等待其完成，或稍后重试。' })
+  }
+  compileLock = fn()
+  const release = () => { compileLock = null }
+  compileLock.then(release, release)
+  return compileLock
+}
 
 // 定位随包分发的 Install.md（Unity 侧安装指南）。两种安装布局都要覆盖：
 //   - pnpm / dsh plugin 安装：<profile>/node_modules/unity-bridge/plugin/unity-bridge.mjs
@@ -102,10 +128,18 @@ function parsePort(value) {
 
 // ── HTTP 客户端 ────────────────────────────────────────────────────────────
 
-function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, port) {
+// 发起单个请求。timeoutMs 为整体超时（socket idle 超时）；
+// firstByteTimeoutMs 为「首字节等待」上限：TCP 已建立但 HTTP 迟迟不响应
+//（Unity 主线程被 Modal 阻塞 / 编译卡死 / 半开放防火墙）时，避免空等完整
+// timeoutMs——这是「任务卡死」最主要的成因。
+function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, port, firstByteTimeoutMs) {
   const base = `http://${HOST}:${port}`
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8')
+    // 首字节计时器：连接建立后指定时间内无任何响应字节 → 判定为黑洞/无响应，
+    // 立即中止，避免吞满整体超时。仅在显式传入 firstByteTimeoutMs 时启用。
+    let firstByteTimer = null
+    let firstByteTimedOut = false
     const req = http.request(
       `${base}${path}`,
       {
@@ -118,6 +152,8 @@ function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, por
         ...(signal ? { signal } : {}),
       },
       (res) => {
+        // 收到响应头即视为「有响应」，取消首字节计时。
+        if (firstByteTimer) clearTimeout(firstByteTimer)
         const chunks = []
         res.on('data', (c) => chunks.push(c))
         res.on('end', () => {
@@ -137,8 +173,20 @@ function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, por
         })
       },
     )
+    if (firstByteTimeoutMs) {
+      firstByteTimer = setTimeout(() => {
+        firstByteTimedOut = true
+        req.destroy(new Error(`Unity Bridge 无响应（${firstByteTimeoutMs}ms 内未返回任何数据）。可能原因：Unity 主线程被模态对话框阻塞、正在执行长任务（构建/烘焙/编译）、或服务已卡死。请到 Unity 窗口检查并手动关闭对话框。`))
+      }, firstByteTimeoutMs)
+      if (firstByteTimer.unref) firstByteTimer.unref()
+    }
     req.on('timeout', () => req.destroy(new Error(`请求超时（${timeoutMs}ms）`)))
-    req.on('error', (err) => reject(new Error(`无法连接 Unity Bridge（${base}）：${err.message}。请确认 Unity 已打开且 Tools/Unity Bridge 已启动。`)))
+    req.on('error', (err) => {
+      if (firstByteTimer) clearTimeout(firstByteTimer)
+      // 首字节超时中止会触发 error；保留其原始诊断信息，避免被下面的通用文案覆盖。
+      const message = firstByteTimedOut ? err.message : `无法连接 Unity Bridge（${base}）：${err.message}。请确认 Unity 已打开且 Tools/Unity Bridge 已启动。`
+      reject(new Error(message))
+    })
     if (data) req.write(data)
     req.end()
   })
@@ -151,31 +199,46 @@ function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, por
 async function call(exec, method, path, body, timeoutMs) {
   const primary = portForExec(exec)
   const fallback = process.env.UNITY_BRIDGE_PORT ? undefined : DEFAULT_PORT
+  // 分级超时：/health 探测请求用短超时（默认 30s 太长，服务无响应时逐个吞 30s 会拖垮整体）；
+  // 普通请求保持调用方指定超时，但对「黑洞端口」（握手成功但无响应）附加首字节上限。
+  const isHealth = path === '/health'
+  const useTimeout = isHealth ? HEALTH_TIMEOUT_MS : (timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  const useFirstByte = isHealth ? true : Boolean(timeoutMs === undefined)
 
   try {
-    return await request(method, path, body, timeoutMs, exec && exec.signal, primary)
+    return await request(method, path, body, useTimeout, exec && exec.signal, primary, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
   } catch (err) {
     if (fallback && fallback !== primary) {
       // 短超时探测回退端口是否真的有响应，避免等满 timeoutMs。
       try {
-        await request('GET', '/health', undefined, 3000, exec && exec.signal, fallback)
+        await request('GET', '/health', undefined, HEALTH_TIMEOUT_MS, exec && exec.signal, fallback, FIRST_BYTE_TIMEOUT_MS)
       } catch {
         throw err // 回退端口无响应，报主候选错误
       }
-      return request(method, path, body, timeoutMs, exec && exec.signal, fallback)
+      return request(method, path, body, useTimeout, exec && exec.signal, fallback, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
     }
     throw err
   }
 }
 
+// 取当前会话项目目录（供 health 校验与错误提示使用）。
+function sessionCwd(exec) {
+  return exec && exec.agent && exec.agent.session && exec.agent.session.header
+    ? exec.agent.session.header.cwd
+    : undefined
+}
+
 // /health 且校验项目路径：兜底连错实例（多实例/端口文件失配）时立即报错。
 async function healthChecked(exec) {
   const h = await call(exec, 'GET', '/health')
-  const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header
-    ? exec.agent.session.header.cwd
-    : undefined
+  const cwd = sessionCwd(exec)
   if (cwd && h.projectPath && normalizePath(cwd) !== normalizePath(h.projectPath)) {
-    throw new Error(`项目不匹配：当前会话目录 ${cwd} 与 Unity 实例项目 ${h.projectPath} 不一致（端口文件指向其他实例或选错项目）。请确认已打开对应项目的 Unity 实例。`)
+    throw new Error(
+      `项目不匹配：当前会话目录 ${cwd} 与 Unity 实例项目 ${h.projectPath} 不一致（端口文件指向其他实例或选错项目）。\n` +
+      `解决方法：① 在目标项目目录（${h.projectPath}）下新建 DSH 会话，或将会话工作目录切到该项目目录；` +
+      `② 或设置环境变量 UNITY_BRIDGE_PORT=<端口> 指向目标实例对应的监听端口后重试。\n` +
+      `若您确实想在本会话操作该项目，可忽略本错误直接使用不校验项目的其它 unity_* 工具。`
+    )
   }
   return h
 }
@@ -183,20 +246,41 @@ async function healthChecked(exec) {
 // 轮询直到编译结束。
 // 编译触发 domain reload 时服务会重建，期间 /health 可能短暂连接失败
 //（ECONNREFUSED/ECONNRESET），属预期行为：捕获后等待重试，不中断轮询。
-async function waitCompileDone(exec, intervalMs = 800, maxWaitMs = 120000) {
+// 增强：
+//  - 指数退避（0.8s → 1.6s → 3.2s … 封顶 5s），减少空转请求数；
+//  - 同时把 `updating`（AssetDatabase 刷新中）视为未完成，避免刷新后读到旧快照；
+//  - reload 恢复窗口内连续失败超过阈值（服务真正下线）即放弃并抛错，不再空耗整个窗口；
+//  - 超时后抛错而不是静默返回「可能仍在编译」的 health，防止调用方误判成功。
+async function waitCompileDone(exec, maxWaitMs = 120000) {
   const start = Date.now()
+  let intervalMs = 800
+  let consecutiveFailures = 0
+  const maxConsecutiveFailures = 4 // 连续 4 次失败（含 reload 抖动）视为服务不可用
   while (Date.now() - start < maxWaitMs) {
     try {
       const h = await call(exec, 'GET', '/health')
-      if (!h.compiling) return h
+      consecutiveFailures = 0
+      if (!h.compiling && !h.updating) return h
     } catch {
-      // reload 窗口：服务正在重建，稍等继续轮询
+      // reload 窗口：服务正在重建，稍等继续轮询；连续失败过多则放弃。
+      consecutiveFailures++
+      if (consecutiveFailures >= maxConsecutiveFailures) {
+        throw new Error(
+          `Unity 在编译/刷新期间连续 ${maxConsecutiveFailures} 次无法响应（${Math.round((Date.now() - start) / 1000)}s），` +
+          `可能是服务未恢复或 Unity 已崩溃。请稍后调用 unity_health 检查，或联系用户确认 Unity 状态。`
+        )
+      }
       await sleep(Math.max(intervalMs, 1200))
+      intervalMs = Math.min(intervalMs * 2, 5000)
       continue
     }
     await sleep(intervalMs)
+    intervalMs = Math.min(intervalMs * 2, 5000)
   }
-  return call(exec, 'GET', '/health')
+  throw new Error(
+    `编译/刷新在 ${Math.round(maxWaitMs / 1000)}s 内未完成（compiling/updating 仍为 true）。` +
+    `可能原因：编译卡死、Unity 主线程被长任务或模态对话框阻塞。请到 Unity 窗口检查，或稍后重试。`
+  )
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
@@ -287,8 +371,10 @@ const UNITY_BRIDGE_CHEATSHEET = `# Unity Bridge 工具速查表
 
 调用约定：
 - unity_mcp 参数：{ tool: "manage_scene", params: { action: "get_active" } }。
-- 结果统一为 { success, data } 或 { success, error }；先看 success 判断成败。
-- 破坏性操作（删除/覆盖/构建）前先用只读 action（get_info/list/get_active）确认目标。`
+- 结果统一为 { success, data }；业务失败（参数缺省/资源不存在/动作不支持）会直接抛错，无需再人工检查 success 字段。
+- 破坏性操作（删除/覆盖/构建）前先用只读 action（get_info/list/get_active）确认目标。
+- 注意：manage_asset search 的 searchTerm 过滤可能无效（会返回全量资产第一页，如 3.6 万条），优先用 get_info(path) 精确定位资源。
+- 注意：unity_execute 反射调用尽量选返回简单值的方法；复杂对象会以结构化 JSON 返回（数组限量 500 项）。`
 
 // ── 插件入口 ───────────────────────────────────────────────────────────────
 
@@ -327,33 +413,45 @@ export function apply(ctx) {
     '触发 Unity 脚本编译并等待完成，返回编译是否成功以及编译错误列表。',
     {},
     async (_args, exec) => {
-      await call(exec, 'POST', '/compile', {}, DEFAULT_TIMEOUT_MS)
-      await waitCompileDone(exec)
-      const health = await healthChecked(exec)
-      // reload 后服务刚重建，日志缓冲可能尚未就绪：失败时重试一次。
-      let logs
-      try {
-        logs = await call(exec, 'POST', '/logs', { level: 'error' })
-      } catch {
-        await sleep(1000)
-        logs = await call(exec, 'POST', '/logs', { level: 'error' })
-      }
-      const errors = logs.compileErrors || []
-      return {
-        success: errors.length === 0,
-        compiling: health.compiling,
-        errorCount: errors.length,
-        errors,
-      }
+      // 前置校验项目匹配 + 服务可用：避免在连错实例/会话目录不符时白白触发编译
+      // 并空等编译结束（校验失败时空转的浪费比任何工具都大）。
+      await healthChecked(exec)
+      // 互斥：已有编译/刷新任务在轮询时，新调用直接告知现状，不再重复触发。
+      const locked = await withCompileLock(async () => {
+        await call(exec, 'POST', '/compile', {}, DEFAULT_TIMEOUT_MS)
+        await waitCompileDone(exec, compileTimeoutMs())
+        const health = await healthChecked(exec)
+        // reload 后服务刚重建，日志缓冲可能尚未就绪：失败时重试一次。
+        let logs
+        try {
+          logs = await call(exec, 'POST', '/logs', { level: 'error' })
+        } catch {
+          await sleep(1000)
+          logs = await call(exec, 'POST', '/logs', { level: 'error' })
+        }
+        const errors = logs.compileErrors || []
+        return {
+          success: errors.length === 0,
+          compiling: health.compiling,
+          errorCount: errors.length,
+          errors,
+        }
+      })
+      return locked
     }, 180000)
 
   register(ctx, 'unity_refresh',
     '刷新 Unity 资源数据库（AssetDatabase.Refresh），并等待编译结束。',
     {},
     async (_args, exec) => {
-      await call(exec, 'POST', '/refresh', {}, DEFAULT_TIMEOUT_MS)
-      await waitCompileDone(exec)
-      return { refreshed: true }
+      // 同 unity_compile：先校验再触发副作用 + 互斥。
+      await healthChecked(exec)
+      const locked = await withCompileLock(async () => {
+        await call(exec, 'POST', '/refresh', {}, DEFAULT_TIMEOUT_MS)
+        await waitCompileDone(exec, compileTimeoutMs())
+        return { refreshed: true }
+      })
+      return locked
     }, 180000)
 
   register(ctx, 'unity_logs',
@@ -401,13 +499,22 @@ export function apply(ctx) {
     (_args, exec) => call(exec, 'GET', '/mcp/catalog'))
 
   register(ctx, 'unity_mcp',
-    '透传调用 Unity 编辑器内 MCP for Unity 包的任意工具（约 30 个，覆盖资源/场景/GameObject/组件/脚本/构建/测试/材质/UI/包管理等）。先调用 unity_mcp_catalog 获取可用工具清单，再指定 tool 与对应 params 执行。',
+    '透传调用 Unity 编辑器内 MCP for Unity 包的任意工具（约 30 个，覆盖资源/场景/GameObject/组件/脚本/构建/测试/材质/UI/包管理等）。先调用 unity_mcp_catalog 获取可用工具清单，再指定 tool 与对应 params 执行。工具的业务失败（参数缺省/资源不存在/动作不支持）会抛错返回，不再返回 success:false 让调用方自行解析。',
     {
       tool: { type: 'string', required: true, description: 'MCP 工具名（如 manage_scene、manage_asset、manage_gameobject、manage_script、manage_build、run_tests 等），见 unity_mcp_catalog。' },
       params: { type: 'object', description: '传给该工具的参数字典（含 action 子操作名与具体参数）。' },
     },
-    (args, exec) => call(exec, 'POST', '/mcp', {
-      tool: args.tool,
-      params: args.params ?? {},
-    }, 180000))
+    async (args, exec) => {
+      const data = await call(exec, 'POST', '/mcp', {
+        tool: args.tool,
+        params: args.params ?? {},
+      }, 180000)
+      // MCP 业务失败包装为 HTTP 200 + `success:false`（服务级 ok=false 才走 call 抛错）。
+      // 这里做第二次校验：业务失败直接抛错，统一走错误通道，避免调用方把失败当成功继续执行。
+      if (data && data.success === false) {
+        const detail = data.error || data.code || 'unknown error'
+        throw new Error(`MCP 工具 ${args.tool} 执行失败: ${detail}`)
+      }
+      return data
+    })
 }

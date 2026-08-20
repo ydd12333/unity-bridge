@@ -56,6 +56,8 @@ namespace UnityBridge
         private const int PortAttempts = 256;
         // 实际监听端口（顺延后的结果），启动成功后被 /health 与端口文件使用。
         private static int _listenPort;
+        // 服务启动时刻（UTC），随 /health 返回，供 DSH 侧确认实例是否为会话期新启动。
+        private static readonly string StartTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
         // 实际端口写入 Library/UnityBridgePort.txt，供 DSH 侧动态发现。
         private static readonly string PortFile = Path.Combine(ProjectRoot, "Library", "UnityBridgePort.txt");
 
@@ -361,6 +363,9 @@ namespace UnityBridge
                 unityVersion = Application.unityVersion,
                 port = Port,
                 projectPath = ProjectPath,
+                // 进程标识与启动时间：多实例场景下帮助 DSH 侧区分连的是哪个 Unity 实例。
+                pid = System.Diagnostics.Process.GetCurrentProcess().Id,
+                startTimeUtc = StartTimeUtc,
             };
         }
 
@@ -395,9 +400,18 @@ namespace UnityBridge
 
             var tail = snapshot.Skip(Math.Max(0, snapshot.Count - limit)).ToList();
 
-            // 编译错误：形如 "error CS..." 的日志条目。
+            // 编译错误：优先匹配 Unity 编译条目（"error CS..." / "error XXXX..." / "error URG..." 等），
+            // 兜底匹配 level==error 且非本服务自身日志的条目，避免遗漏 shader/资源编译错误。
             var compileErrors = snapshot
-                .Where(l => l.level == "error" && l.message != null && l.message.Contains("error CS"))
+                .Where(l => l.level == "error" && l.message != null
+                    && !l.message.StartsWith("[UnityBridge]", StringComparison.Ordinal)
+                    && (l.message.Contains("error CS")
+                        || l.message.Contains("error URG")
+                        || l.message.Contains("error BC")
+                        || l.message.Contains("error LIT")
+                        || l.message.Contains("error X")
+                        || l.message.Contains("Compilation failed")
+                        || l.message.Contains("Failed to compile")))
                 .Select(l => l.message)
                 .ToList();
 
@@ -479,7 +493,68 @@ namespace UnityBridge
             }
 
             var result = method.Invoke(null, invokeArgs);
-            return new { executed = true, result = result == null ? "null" : result.ToString() };
+            return new { executed = true, result = FormatInvokeResult(result) };
+        }
+
+        // 把反射执行结果格式化为可供 AI 使用的信息：
+        //  - 数组/集合/字典 → 序列化为 JSON（限量 500 项，标注 total/hasMore），避免 ToString 只给类型名；
+        //  - UnityEngine.Object → 返回类型/名称/路径/GUID；
+        //  - 其余简单值 → ToString。
+        private static object FormatInvokeResult(object result)
+        {
+            if (result == null) return "null";
+
+            if (result is UnityEngine.Object unityObj)
+            {
+                var path = AssetDatabase.GetAssetPath(unityObj);
+                var guid = string.IsNullOrEmpty(path) ? "" : AssetDatabase.AssetPathToGUID(path);
+                return new
+                {
+                    type = unityObj.GetType().FullName,
+                    name = unityObj.name,
+                    path,
+                    guid,
+                };
+            }
+
+            if (result is System.Collections.IEnumerable seq && !(result is string))
+            {
+                var list = new List<object>();
+                var max = 500;
+                var hasMore = false;
+                foreach (var item in seq)
+                {
+                    if (list.Count >= max)
+                    {
+                        hasMore = true;
+                        break;
+                    }
+                    list.Add(FormatScalarForJson(item));
+                }
+                return new
+                {
+                    type = result.GetType().FullName,
+                    count = list.Count,
+                    truncated = hasMore,
+                    items = list,
+                };
+            }
+
+            return result.ToString();
+        }
+
+        // 集合元素常规化：避免元素本身是复杂对象时 ToString 丢失信息。
+        private static object FormatScalarForJson(object item)
+        {
+            if (item == null) return null;
+            if (item is UnityEngine.Object uo)
+            {
+                var p = AssetDatabase.GetAssetPath(uo);
+                return new { type = uo.GetType().FullName, name = uo.name, path = p };
+            }
+            if (item.GetType().IsPrimitive || item is string || item is decimal || item is DateTime)
+                return item;
+            return item.ToString();
         }
 
         private static object DoOpenScene(JObject args)
@@ -596,10 +671,61 @@ namespace UnityBridge
             return new { success = true, tool, data = result };
         }
 
-        // /mcp/catalog：反射枚举所有 [McpForUnityTool] 工具清单（名称 + 描述 + 分组）。
+        // /mcp/catalog：复用 MCP 包的 ToolDiscoveryService（MCPServiceLocator）枚举全部工具，
+        // 返回完整元数据：名称、描述（含 "Tool: xxx" 回退）、分组、以及每个参数的
+        // 名称/类型/是否必填/默认值——解决「catalog 描述全 null、AI 只能靠试错猜参数」的问题。
+        // 注意：该服务在首次调用时反射全程序集，可能耗时数百 ms，属一次性成本（有缓存）。
         private static object GetMcpCatalog()
         {
-            var list = new List<McpToolInfo>();
+            List<MCPForUnity.Editor.Services.ToolMetadata> tools;
+            try
+            {
+                tools = MCPForUnity.Editor.Services.MCPServiceLocator.ToolDiscovery.DiscoverAllTools();
+            }
+            catch (Exception ex)
+            {
+                // 防御：MCP 包版本差异导致找不到服务时，回退到轻量反射（名称+分组，无参数）。
+                return new
+                {
+                    count = -1,
+                    fallback = true,
+                    error = ex.Message,
+                    tools = GetMcpCatalogLight(),
+                };
+            }
+
+            return new
+            {
+                count = tools?.Count ?? 0,
+                tools = (tools ?? new List<MCPForUnity.Editor.Services.ToolMetadata>())
+                    .OrderBy(t => t.Name)
+                    .Select(t => new
+                    {
+                        tool = t.Name,
+                        description = string.IsNullOrEmpty(t.Description) ? $"Tool: {t.Name}" : t.Description,
+                        group = t.Group,
+                        structuredOutput = t.StructuredOutput,
+                        requiresPolling = t.RequiresPolling,
+                        pollAction = t.PollAction,
+                        parameters = (t.Parameters ?? new List<MCPForUnity.Editor.Services.ParameterMetadata>())
+                            .OrderByDescending(p => p.Required)
+                            .ThenBy(p => p.Name)
+                            .Select(p => new
+                            {
+                                name = p.Name,
+                                type = p.Type,
+                                required = p.Required,
+                                description = p.Description,
+                                defaultValue = p.DefaultValue,
+                            }).ToList(),
+                    }).ToList(),
+            };
+        }
+
+        // 轻量回退：仅反射 attribute（名称 + 类型 + 分组），无参数信息。
+        private static List<object> GetMcpCatalogLight()
+        {
+            var list = new List<object>();
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
                 Type[] types;
@@ -611,12 +737,7 @@ namespace UnityBridge
                     var attr = type.GetCustomAttribute<McpForUnityToolAttribute>();
                     if (attr == null) continue;
 
-                    var method = type.GetMethod("HandleCommand",
-                        BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(JObject) }, null);
-                    if (method == null) continue;
-
-                    list.Add(new McpToolInfo
+                    list.Add(new
                     {
                         tool = string.IsNullOrEmpty(attr.Name) ? ToSnakeCase(type.Name) : attr.Name,
                         type = type.FullName,
@@ -625,26 +746,7 @@ namespace UnityBridge
                     });
                 }
             }
-
-            return new
-            {
-                count = list.Count,
-                tools = list.OrderBy(t => t.tool).Select(t => new
-                {
-                    t.tool,
-                    t.type,
-                    t.description,
-                    t.group,
-                }).ToList(),
-            };
-        }
-
-        private sealed class McpToolInfo
-        {
-            public string tool;
-            public string type;
-            public string description;
-            public string group;
+            return list;
         }
 
         private static string ToSnakeCase(string name)
@@ -714,7 +816,9 @@ namespace UnityBridge
             if (target.IsEnum) return Enum.Parse(target, value);
 
             var underlying = Nullable.GetUnderlyingType(target) ?? target;
-            return Convert.ChangeType(value, underlying);
+            // 显式使用 InvariantCulture 转换数值：避免中文/欧洲系统区域性
+            //（如小数分隔符为 ','）导致 "1.5" 解析失败。
+            return Convert.ChangeType(value, underlying, System.Globalization.CultureInfo.InvariantCulture);
         }
 
         [Serializable]
