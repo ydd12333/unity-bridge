@@ -284,11 +284,19 @@ namespace UnityBridge
         }
 
         // ── 主线程执行辅助 ───────────────────────────────────────────────────
+        //
+        // 借鉴团结 AI（CodelyBridge / InvokeOnMainThreadWithTimeout）的防卡死设计：
+        // 主线程调度不设无限期等待。若 Unity 主线程被模态对话框 / 长任务 / 编译
+        // 阻塞，OnEditorUpdate 不会消费 MainQueue，此时给 HTTP 端一个确定的超时
+        // 错误响应（而非永久挂起），让 DSH 侧能快速失败并给出诊断指引。
+        private const int MainThreadTimeoutMs = 15000;
 
         private static Task<object> RunOnMain(Func<object> action)
         {
             var item = new WorkItem { Action = action };
             MainQueue.Enqueue(item);
+            // 超时兜底：主线程队列迟迟不被消费时，返回错误响应而不是让 HTTP 线程无限等。
+            _ = ScheduleTimeout(item, MainThreadTimeoutMs, "Unity 主线程无响应");
             return item.Completion.Task;
         }
 
@@ -331,6 +339,22 @@ namespace UnityBridge
             public Func<Task<object>> Factory;
             public readonly TaskCompletionSource<Task<object>> Completion =
                 new TaskCompletionSource<Task<object>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        // 超时兜底：主线程队列项在 timeoutMs 内未被消费时，用错误结果完成其 TCS。
+        // 仅当 TCS 尚未完成时生效（TrySet 幂等），任务迟到的正常完成会被忽略。
+        private static async Task ScheduleTimeout(WorkItem item, int timeoutMs, string reason)
+        {
+            await Task.Delay(timeoutMs).ConfigureAwait(false);
+            item.Completion.TrySetException(new TimeoutException(
+                $"{reason}（等待主线程队列超过 {timeoutMs / 1000}s）。可能原因：Unity 主线程被模态对话框阻塞、正在执行长任务（构建/烘焙/编译）、或编辑器已卡死。请到 Unity 窗口检查。"));
+        }
+
+        private static async Task ScheduleTimeout(AsyncWorkItem item, int timeoutMs, string reason)
+        {
+            await Task.Delay(timeoutMs).ConfigureAwait(false);
+            item.Completion.TrySetException(new TimeoutException(
+                $"{reason}（等待主线程队列超过 {timeoutMs / 1000}s）。可能原因：Unity 主线程被模态对话框阻塞、正在执行长任务（构建/烘焙/编译）、或编辑器已卡死。请到 Unity 窗口检查。"));
         }
 
         // ── 日志收集 ─────────────────────────────────────────────────────────
@@ -379,6 +403,7 @@ namespace UnityBridge
 
         private static object DoRefresh()
         {
+            EnsureWriteSafe("refresh", "刷新资源数据库");
             AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
             return new { accepted = true };
         }
@@ -431,10 +456,17 @@ namespace UnityBridge
                 throw new Exception("execute 需要 className 与 methodName");
 
             // 特殊通道：className == "__menu" 时，methodName 为 Unity 菜单路径。
+            // Play/Pause 模式下拦截菜单执行（弹窗/运行态修改会破坏编辑器状态）。
             if (className == "__menu")
             {
+                EnsureWriteSafe("execute_menu", $"执行菜单 {methodName}");
                 EditorApplication.ExecuteMenuItem(methodName);
                 return new { executed = true, result = $"menu item invoked: {methodName}" };
+            }
+            // 反射静态方法：仅对已知破坏性类型做写保护（EditorApplication/SceneManagement 等）。
+            if (IsDestructiveType(className))
+            {
+                EnsureWriteSafe("execute_reflect", $"执行 {className}.{methodName}");
             }
 
             var type = FindType(className)
@@ -563,6 +595,8 @@ namespace UnityBridge
             if (string.IsNullOrWhiteSpace(path))
                 throw new Exception("scene/open 需要 path");
 
+            EnsureWriteSafe("scene_open", $"打开场景 {path}");
+
             var scene = EditorSceneManager.OpenScene(path, OpenSceneMode.Single);
             return new { opened = scene.IsValid(), path = scene.path, name = scene.name };
         }
@@ -642,6 +676,9 @@ namespace UnityBridge
         {
             var item = new AsyncWorkItem { Factory = factory };
             MainAsyncQueue.Enqueue(item);
+            // MCP 工具耗时可能较长（构建/测试），超时放宽到 30s；
+            // 主线程完全卡死（Modal/长任务）时仍会兜底报错而非无限等。
+            _ = ScheduleTimeout(item, 30000, "MCP 调用无法在主线程启动");
             return item.Completion.Task;
         }
 
@@ -766,6 +803,54 @@ namespace UnityBridge
                 }
             }
             return sb.ToString();
+        }
+
+        // ── 写保护（WriteGuard 简化版，借鉴团结 AI CodelyBridge）──
+        //
+        // 在 Play/Pause 模式下拦截破坏性写操作：
+        //  - execute 菜单路径（弹窗/运行态修改会破坏编辑器状态）
+        //  - 已知破坏性的反射类型（编辑器生命周期 / 场景 / 资产导入）
+        //  - scene/open 与 refresh（会替换当前场景 / 触发重新导入）
+        // MCP 工具的写 action 由 MCP 包内部自行防护（其 WriteGuard 已有 18 处
+        // EditorApplication.isPlaying 检查），这里只做本服务自带端点的兜底。
+
+        private static bool IsInPlayMode =>
+            EditorApplication.isPlaying || EditorApplication.isPaused;
+
+        private static void EnsureWriteSafe(string op, string detail)
+        {
+            if (IsInPlayMode)
+            {
+                throw new InvalidOperationException(
+                    $"已拒绝在播放模式下执行写操作 [{op}]：{detail}。请先停止播放（ManageEditor stop / Unity 编辑器 Play 按钮），再重试。");
+            }
+        }
+
+        // 已知破坏性的反射目标类型：这些类型的静态方法会改动编辑器/场景/资产状态，
+        // 在播放模式下一律拦截；其余只读查询类型（AssetDatabase 查询、Application 等）放行。
+        private static readonly HashSet<string> DestructiveTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "UnityEditor.EditorApplication",
+            "UnityEditor.SceneManagement.EditorSceneManager",
+            "UnityEditor.AssetDatabase",
+            "UnityEditor.Compilation.CompilationPipeline",
+            "UnityEngine.SceneManagement.SceneManager",
+            "UnityEditor.Lightmapping",
+            "UnityEditor.AudioImporter",
+            "UnityEditor.EditorBuildSettings",
+        };
+
+        private static bool IsDestructiveType(string className)
+        {
+            if (string.IsNullOrEmpty(className)) return false;
+            // 命中精确类型名或命名空间前缀（如 UnityEditor.SceneManagement.* 整个都是破坏性的）
+            if (DestructiveTypes.Contains(className)) return true;
+            foreach (var dangerous in DestructiveTypes)
+            {
+                if (className.StartsWith(dangerous + ".", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         // ── 工具方法 ─────────────────────────────────────────────────────────
