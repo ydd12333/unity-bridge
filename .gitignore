@@ -1,0 +1,6 @@
+# pnpm 测试残留
+.pnpm-store/
+
+# PowerShell 脚本测试残留
+.test-*-home/
+

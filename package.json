@@ -1,0 +1,34 @@
+{
+  "name": "unity-bridge",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness plugin: control a local Unity editor — compile, refresh assets, read console/compile logs, execute editor static methods, open scenes, query assets, and pass through all MCP for Unity tools.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "unity",
+    "unity3d",
+    "mcp"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "plugin/unity-bridge.mjs",
+  "exports": {
+    ".": "./plugin/unity-bridge.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "plugin",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

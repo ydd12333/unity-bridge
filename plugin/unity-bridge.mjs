@@ -1,13 +1,24 @@
 // 作者: ydd12333
 //
-// DSH 侧 Unity Bridge 客户端插件。
-// 由真实 Node ESM 加载（preset 插件，非动态 Cordis 沙箱），因此可用 node:http
-// 与 Unity 侧的本地 HTTP 服务通信。注册 7 个模型可调用的工具：
+// DSH 侧 Unity Bridge 客户端插件（host 全局插件，npm 包 main 入口）。
+// 由真实 Node ESM 加载（非动态 Cordis 沙箱），因此可用 node:http 与 Unity
+// 侧的本地 HTTP 服务通信。注册 9 个模型可调用的工具：
 //   unity_health / unity_compile / unity_refresh / unity_logs /
-//   unity_execute / unity_scene_open / unity_asset_get
+//   unity_execute / unity_scene_open / unity_asset_get /
+//   unity_mcp_catalog / unity_mcp
 //
-// 注意：本文件通过 preset 目录的相对路径加载，内部无法解析 harness 的
-// @deepseek-ai/dsh-tools，因此手写完整 ToolDefinition 传给 ctx.tools.register。
+// 安装（推荐）：把本仓库作为 DSH 插件包一键安装——
+//   cd unity-bridge 仓库目录
+//   dsh plugin --profile web add .          # 或 pnpm dsh plugin --profile web add .
+//   或从 git：dsh plugin --profile web add https://github.com/ydd12333/unity-bridge.git
+// dsh plugin 内部在 DSH profile 目录执行 pnpm add，装好后自动把声明了
+// dsh.bundle 的本包加入 profile 层栈（见仓库根 cordis.patch.yml 与
+// package.json 的 dsh.bundle 声明），无需手改任何配置；重启 profile 生效。
+//
+// 作为 host 全局插件，任何 preset、任何会话都可用 unity_* 工具。
+//
+// 注意：本文件经包入口加载，内部无法解析 harness 的 @deepseek-ai/dsh-tools，
+// 因此手写完整 ToolDefinition 传给 ctx.tools.register。
 // register 的 parameters 直接投影给模型，必须是完整 JSON Schema。
 
 import http from 'node:http'
@@ -222,7 +233,7 @@ function register(ctx, name, description, props, execute, timeoutMs) {
 
 const UNITY_BRIDGE_CHEATSHEET = `# Unity Bridge 工具速查表
 
-本 preset 提供两类 Unity 编辑器工具：
+本插件提供两类 Unity 编辑器工具：
 - 精选工具（unity_health/compile/refresh/logs/execute/scene_open/asset_get）：已做参数约束与编译轮询。
 - 透传工具 unity_mcp：调用 Unity 内 MCP for Unity 包的任意工具。先用 unity_mcp_catalog 查清单，再传 { tool, params }。
 

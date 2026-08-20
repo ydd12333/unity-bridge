@@ -1,0 +1,10 @@
+# unity-bridge bundle patch: register the unity_* tools as a host-global plugin.
+#
+# Installed via `dsh plugin --profile <name> add <spec>` (or pnpm): once the
+# package is in the profile's node_modules, this patch layer is applied by the
+# profile boot. The row name MUST equal the package name ('unity-bridge') so
+# the loader resolves it through the profile's Node parent-walk to the package
+# main entry (plugin/unity-bridge.mjs).
+- insert:
+    - id: tool-unity-bridge
+      name: 'unity-bridge'
