@@ -270,6 +270,7 @@ const UNITY_BRIDGE_CHEATSHEET = `# Unity Bridge 工具速查表
 - 日志 read_console：plain / json / detailed
 - 刷新 refresh_unity：mode(force/if_dirty) + scope + compile
 - 菜单 execute_menu_item：menu_path（如 "File/Save Project"）
+  ⚠ 禁止调用会弹模态对话框的交互式菜单（如 Tools/Unity Bridge/Status、Stop）——会阻塞 Unity 主线程，导致 bridge 与 /health 全部超时，必须人工点掉对话框才恢复。只调用无 UI 的菜单项。
 - 编辑器 manage_editor：play / pause / stop / undo / redo / set_resolution / set_quality / add_tag / remove_tag / add_layer / remove_layer
 - 材质 manage_material：create / set_material_color / assign_material_to_renderer / get_material_info
 - UI manage_ui：create / read / update / delete / list / render_ui / get_visual_tree
@@ -367,7 +368,7 @@ export function apply(ctx) {
     }))
 
   register(ctx, 'unity_execute',
-    '执行 Unity 编辑器静态方法，或按菜单路径执行菜单项。className 传 "__menu" 时按菜单路径执行（如 "File/Save Project"）；否则按 命名空间.类名.方法名 反射执行静态方法（方法名可选）。',
+    '执行 Unity 编辑器静态方法，或按菜单路径执行菜单项。className 传 "__menu" 时按菜单路径执行（如 "File/Save Project"）；否则按 命名空间.类名.方法名 反射执行静态方法（方法名可选）。⚠ 禁止执行会弹模态对话框的交互式菜单（如 Tools/Unity Bridge/Status、Stop）——会阻塞 Unity 主线程导致 bridge 卡死超时。',
     {
       className: { type: 'string', required: true, description: '类全名，或 "__menu" 表示执行菜单项。' },
       methodName: { type: 'string', required: true, description: '静态方法名，或菜单路径（className 为 __menu 时）。' },
