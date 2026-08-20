@@ -103,7 +103,7 @@ MCP for Unity 更久）。此阶段：
 | `unity_health` 正常但 `unity_mcp_catalog` 失败 | MCP for Unity 未随包解析成功；回 Unity 看 Package Manager 是否报错 |
 | 端口占用 | 默认 8321 被占自动顺延，最多 256 个端口（8321~8576）；全被占时 Console 有警告，检查 Hyper-V/WSL2/Docker 保留区 |
 | 服务启动失败 | Unity Console 应显示 `[UnityBridge] 已启动` 或具体异常；把报错信息转给用户排查 |
-| bridge 全部超时（含 `/health`） | 大概率是刚才通过菜单/静态方法触发了**模态对话框**（如 `Tools/Unity Bridge/Status`、`Stop`），阻塞了 Unity 主线程。无法自动关闭——请用户到 Unity 窗口手动点掉对话框后恢复。**以后不要通过 bridge 调用任何会弹窗的交互式菜单** |
+| bridge 全部超时（含 `/health`） | 大概率是刚才通过菜单/静态方法触发了**模态对话框**（如某些 Status/Stop 类菜单，本包已移除自己的弹窗菜单），阻塞了 Unity 主线程。无法自动关闭——请用户到 Unity 窗口手动点掉对话框后恢复。**以后不要通过 bridge 调用任何会弹窗的交互式菜单** |
 
 ---
 

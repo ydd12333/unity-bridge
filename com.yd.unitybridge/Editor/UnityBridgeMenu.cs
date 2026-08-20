@@ -1,6 +1,9 @@
 // 作者: ydd12333
 //
-// Unity Bridge 菜单入口：启停服务、显示状态、发送测试请求。
+// Unity Bridge 菜单入口：启动服务、发送测试请求。
+// 注意：已移除会弹模态对话框的交互式菜单（Status、Stop）——它们会阻塞
+// Unity 主线程，导致通过 bridge（/health 等）的调用全部超时。如需停止
+// 服务，直接关闭 Unity 编辑器即可（服务随编辑器退出自动停止）。
 
 using System;
 using UnityEditor;
@@ -16,25 +19,7 @@ namespace UnityBridge
             UnityBridgeServer.Start();
         }
 
-        [MenuItem("Tools/Unity Bridge/Stop", false, 1)]
-        public static void Stop()
-        {
-            UnityBridgeServer.Stop();
-        }
-
-        [MenuItem("Tools/Unity Bridge/Status", false, 2)]
-        public static void Status()
-        {
-            var running = UnityBridgeServer.IsRunning;
-            EditorUtility.DisplayDialog(
-                "Unity Bridge",
-                running
-                    ? $"运行中\nhttp://{UnityBridgeServer.Host}:{UnityBridgeServer.Port}/"
-                    : "未运行",
-                "确定");
-        }
-
-        [MenuItem("Tools/Unity Bridge/Test Request", false, 3)]
+        [MenuItem("Tools/Unity Bridge/Test Request", false, 1)]
         public static void TestRequest()
         {
             if (!UnityBridgeServer.IsRunning)

@@ -102,7 +102,7 @@ namespace UnityBridge
             }
 
             Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用（最后一次错误：{lastError?.Message}）。" +
-                             "请关闭占用这些端口的程序后重试，或通过菜单 Tools/Unity Bridge/Stop 手动停止。");
+                             "请关闭占用这些端口的程序后重试，或重启 Unity 编辑器。");
             Stop();
             return false;
         }
