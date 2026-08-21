@@ -126,15 +126,16 @@ namespace UnityBridge
                                  "     官方排查手册：https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/tcp-ip-port-exhaustion-troubleshooting\n" +
                                  "  ③ 若为防火墙/杀软拦截：放行 127.0.0.1 本地回环监听后重试。");
             }
-            else if (WinErrorCode(lastError) == 32)
+            else if (WinErrorCode(lastError) == 32 || WinErrorCode(lastError) == 400)
             {
-                // ERROR_SHARING_VIOLATION：共享冲突——常见于同一地址已被另一实例/残留句柄独占，
-                // 与普通端口占用（10013）的解决方向不同，单独提示。
-                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用，且最后一次为共享冲突（ErrorCode 32，ERROR_SHARING_VIOLATION）：{lastError?.Message}\n" +
-                                 "共享冲突通常是“同一地址已存在另一个监听者”，请按下面方向排查：\n" +
+                // 共享冲突/已有监听者：32 (ERROR_SHARING_VIOLATION) 或 400 (HTTP.sys another listener)，
+                // 常见于同地址已被另一实例/同进程残留 listener 独占，解决方向一致。
+                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用，且最后一次为共享冲突/已监听（ErrorCode {WinErrorCode(lastError)}）：{lastError?.Message}\n" +
+                                 "这通常是“该端口已有另一个监听者”，请按下面方向排查：\n" +
                                  "  ① 检查是否有其它 Unity 编辑器实例在跑（每个实例都会从 8321 起顺延占用端口，\n" +
                                  "     同项目多实例还会互相覆盖端口文件）；确认后关闭多余实例重试；\n" +
-                                 "  ② 也可能是上次退出未释放的残留监听（服务异常退出导致句柄未释放），重启 Unity 编辑器即可；\n" +
+                                 "  ② 也可能是同一进程内的残留 HttpListener（服务异常退出/重复初始化导致句柄未释放），\n" +
+                                 "     重启 Unity 编辑器即可清除；\n" +
                                  "  ③ 仍不行再查占用进程：netstat -ano | findstr 8321，再 taskkill /PID <PID> /F。");
             }
             else
@@ -152,12 +153,17 @@ namespace UnityBridge
             return false;
         }
 
-        // HttpListener 在端口被占用时抛 HttpListenerException（ErrorCode 为
-        // ERROR_ACCESS_DENIED 10013 或 ERROR_SHARING_VIOLATION 32）。
+        // HttpListener 在端口被占用时抛 HttpListenerException，其 ErrorCode 视占用来源而异：
+        //   - 32    (ERROR_SHARING_VIOLATION)：共享冲突，常见于另一句柄/实例已绑定同一地址；
+        //   - 400   (HTTP.sys "another listener")：同地址已存在监听者（实测最常见，见下注）；
+        //   - 10013 (WSAEACCES / ERROR_ACCESS_DENIED)：端口被其他进程占用，或 URL 前缀 ACL 拒绝。
+        // 实测（Unity 内 execute_code）同进程内再次绑定已在监听的端口，抛出的正是
+        // HttpListenerException(400)（消息 "There's another listener for ..."），
+        // 老代码漏判 400 会把它当“非端口占用”提前中断顺延，导致启动失败。
         private static bool IsPortInUse(Exception ex)
         {
             return ex is HttpListenerException hle &&
-                   (hle.ErrorCode == 10013 || hle.ErrorCode == 32);
+                   (hle.ErrorCode == 10013 || hle.ErrorCode == 32 || hle.ErrorCode == 400);
         }
 
         // 取 Windows 原生错误码（HttpListenerException.ErrorCode 即 Win32 码）；
