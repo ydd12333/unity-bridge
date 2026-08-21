@@ -26,6 +26,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Threading;
@@ -103,8 +104,11 @@ namespace UnityBridge
                 if (ok) return true;
                 lastAttemptPort = port;
 
-                // 非端口占用异常（权限、系统错误等）没有顺延意义，立即中止。
-                if (!IsPortInUse(lastError))
+                // 顺延策略：默认继续尝试下一个端口——端口绑定的网络类异常（HttpListenerException /
+                // SocketException，含各种 32/400/10013/10048 等）绝大多数都是“该地址/端口被占”，
+                // 换一个空端口即可；逐个枚举错误码白名单必然漏判（实测已连续踩中 400、10048），
+                // 因此只对“明确换端口无用”的异常类型才中止。
+                if (ShouldAbortPortScan(lastError))
                 {
                     abortedEarly = true;
                     break;
@@ -114,9 +118,8 @@ namespace UnityBridge
             // 按失败原因给出准确提示，避免一律误报“所有端口均被占用”。
             if (abortedEarly)
             {
-                // 非端口占用错误（未命中 10013/32）：更换端口不会解决，
-                // 列出异常类型、可能的根因与各自解决途径，并附微软官方文档。
-                Debug.LogWarning($"[UnityBridge] 启动失败：在端口 {lastAttemptPort} 上遇到非端口占用错误：{lastError?.GetType().Name}: {lastError?.Message}\n" +
+                // 换端口无用的异常（权限、系统资源等）导致提前中止：列出类型与解决途径，附文档。
+                Debug.LogWarning($"[UnityBridge] 启动失败：在端口 {lastAttemptPort} 上遇到换端口无法解决的错误：\n{ExceptionDetail(lastError)}\n" +
                                  "该类错误与端口是否空闲无关，更换端口不会解决。请按下面方向排查：\n" +
                                  "  ① 权限问题（UnauthorizedAccessException / ErrorCode 5 等）：确认当前 Windows 用户对监听地址有访问权，\n" +
                                  "     一般无需配置；若改动过 URL 前缀 ACL，可用 netsh http show urlacl 检查。官方参考：\n" +
@@ -126,51 +129,70 @@ namespace UnityBridge
                                  "     官方排查手册：https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/tcp-ip-port-exhaustion-troubleshooting\n" +
                                  "  ③ 若为防火墙/杀软拦截：放行 127.0.0.1 本地回环监听后重试。");
             }
-            else if (WinErrorCode(lastError) == 32 || WinErrorCode(lastError) == 400)
-            {
-                // 共享冲突/已有监听者：32 (ERROR_SHARING_VIOLATION) 或 400 (HTTP.sys another listener)，
-                // 常见于同地址已被另一实例/同进程残留 listener 独占，解决方向一致。
-                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用，且最后一次为共享冲突/已监听（ErrorCode {WinErrorCode(lastError)}）：{lastError?.Message}\n" +
-                                 "这通常是“该端口已有另一个监听者”，请按下面方向排查：\n" +
-                                 "  ① 检查是否有其它 Unity 编辑器实例在跑（每个实例都会从 8321 起顺延占用端口，\n" +
-                                 "     同项目多实例还会互相覆盖端口文件）；确认后关闭多余实例重试；\n" +
-                                 "  ② 也可能是同一进程内的残留 HttpListener（服务异常退出/重复初始化导致句柄未释放），\n" +
-                                 "     重启 Unity 编辑器即可清除；\n" +
-                                 "  ③ 仍不行再查占用进程：netstat -ano | findstr 8321，再 taskkill /PID <PID> /F。");
-            }
             else
             {
-                // 10013（WSAEACCES）等：最典型是端口确实被其他进程占用，或 URL ACL 拒绝绑定。
-                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用（最后一次错误码 {WinErrorCode(lastError)}：{lastError?.Message}）。\n" +
+                // 顺延 256 个端口全部失败（网络绑定类，如各种 10013/10048/32/400 的“端口被占”）。
+                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用（最后一次错误码 {WinErrorCode(lastError)}）：\n{ExceptionDetail(lastError)}\n" +
                                  "请按下面方向排查：\n" +
                                  "  ① 找出占用端口的进程并结束：netstat -ano | findstr 8321，再 taskkill /PID <PID> /F；\n" +
                                  "     若 8321 空闲但 8322~8576 被占，把 8321 换成对应最小编号的占用端口再查；\n" +
                                  "  ② 若端口段被 Windows 动态端口保留区占满（Hyper-V/WSL2/Docker 会保留整段端口）：\n" +
                                  "     netsh int ipv4 show excludedportrange protocol=tcp 查看保留段，必要时重启以刷新保留表；\n" +
-                                 "  ③ 也可重启 Unity 编辑器重试（服务随编辑器启动自动顺延）。");
+                                 "  ③ 也可能是其他 Unity 实例已在跑（各自顺延占用了大量端口）或同进程残留监听：\n" +
+                                 "     关闭多余 Unity 实例 / 重启 Unity 编辑器后重试。");
             }
             Stop();
             return false;
         }
 
-        // HttpListener 在端口被占用时抛 HttpListenerException，其 ErrorCode 视占用来源而异：
-        //   - 32    (ERROR_SHARING_VIOLATION)：共享冲突，常见于另一句柄/实例已绑定同一地址；
-        //   - 400   (HTTP.sys "another listener")：同地址已存在监听者（实测最常见，见下注）；
-        //   - 10013 (WSAEACCES / ERROR_ACCESS_DENIED)：端口被其他进程占用，或 URL 前缀 ACL 拒绝。
-        // 实测（Unity 内 execute_code）同进程内再次绑定已在监听的端口，抛出的正是
-        // HttpListenerException(400)（消息 "There's another listener for ..."），
-        // 老代码漏判 400 会把它当“非端口占用”提前中断顺延，导致启动失败。
-        private static bool IsPortInUse(Exception ex)
+        // 端口扫描中止策略：返回 true 表示“换端口无用，应停止顺延”，否则继续尝试下一个端口。
+        // 端口绑定失败主要抛 HttpListenerException 或 SocketException，其 ErrorCode 覆盖
+        // 各种“地址/端口已占用”（400 / 10048 / 10013 / 32 等）。逐个枚举会不断漏判
+        // （实测已连续踩中 400、10048），故这里采用**黑名单**：只有明确与具体端口无关、
+        // 换端口必然无效的异常（权限、系统资源、非网络层错误）才中止，网络绑定类一律顺延。
+        private static bool ShouldAbortPortScan(Exception ex)
         {
-            return ex is HttpListenerException hle &&
-                   (hle.ErrorCode == 10013 || hle.ErrorCode == 32 || hle.ErrorCode == 400);
+            // 权限类：换端口同样无权限绑定，中止。
+            if (ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+                return true;
+
+            // 网络绑定类（HttpListenerException / SocketException）：无论具体错误码，都视为
+            // “当前端口未绑上但下一个可能成功”，默认顺延，避免漏判。
+            if (ex is HttpListenerException || ex is SocketException)
+                return false;
+
+            // 其它异常：保守起见继续尝试（宁多试几次，也不漏掉可用的空闲端口）。
+            return false;
         }
 
-        // 取 Windows 原生错误码（HttpListenerException.ErrorCode 即 Win32 码）；
-        // 非 HttpListenerException 时返回 -1，用于区分“端口占用”与“其它错误”。
+        // 取 Windows 原生错误码（仅用于展示，不再参与顺延判定）：
+        // HttpListenerException.ErrorCode 与 SocketException.ErrorCode 都是 Win32/套接字错误码。
         private static int WinErrorCode(Exception ex)
         {
-            return (ex as HttpListenerException)?.ErrorCode ?? -1;
+            if (ex is HttpListenerException hle) return hle.ErrorCode;
+            if (ex is SocketException se) return se.ErrorCode;
+            return -1;
+        }
+
+        // 生成完整异常详情：类型 + 消息 + 完整堆栈，并递归展开 InnerException，
+        // 方便定位真正的根因（网络绑定失败的异常常被包装，仅打印 Message 会丢失堆栈信息）。
+        private static string ExceptionDetail(Exception ex)
+        {
+            if (ex == null) return "(null)";
+            var sb = new StringBuilder();
+            for (var e = ex; e != null; e = e.InnerException)
+            {
+                if (sb.Length > 0) sb.AppendLine().AppendLine("  ── 内部异常 (InnerException) ──");
+                sb.Append("异常类型: ").AppendLine(e.GetType().FullName);
+                sb.Append("消息: ").AppendLine(e.Message);
+                sb.Append("错误码: ").AppendLine(WinErrorCode(e).ToString());
+                sb.Append("堆栈: ");
+                if (!string.IsNullOrEmpty(e.StackTrace))
+                    sb.AppendLine(e.StackTrace);
+                else
+                    sb.AppendLine("(无堆栈信息)");
+            }
+            return sb.ToString();
         }
 
         // 尝试在指定端口启动监听；成功则写端口文件并挂接日志/更新回调。
