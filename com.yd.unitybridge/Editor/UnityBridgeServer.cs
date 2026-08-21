@@ -93,18 +93,61 @@ namespace UnityBridge
             if (_running) return true;
 
             var lastError = (Exception)null;
+            var lastAttemptPort = 0;
+            // 提前中止（非端口占用错误）：true 时不是“全部端口都被占”，而是首个失败端口即不可顺延。
+            var abortedEarly = false;
             for (var attempt = 0; attempt < PortAttempts; attempt++)
             {
                 var port = DefaultPort + attempt;
                 var ok = TryStartOnPort(port, out lastError);
                 if (ok) return true;
+                lastAttemptPort = port;
 
                 // 非端口占用异常（权限、系统错误等）没有顺延意义，立即中止。
-                if (!IsPortInUse(lastError)) break;
+                if (!IsPortInUse(lastError))
+                {
+                    abortedEarly = true;
+                    break;
+                }
             }
 
-            Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用（最后一次错误：{lastError?.Message}）。" +
-                             "请关闭占用这些端口的程序后重试，或重启 Unity 编辑器。");
+            // 按失败原因给出准确提示，避免一律误报“所有端口均被占用”。
+            if (abortedEarly)
+            {
+                // 非端口占用错误（未命中 10013/32）：更换端口不会解决，
+                // 列出异常类型、可能的根因与各自解决途径，并附微软官方文档。
+                Debug.LogWarning($"[UnityBridge] 启动失败：在端口 {lastAttemptPort} 上遇到非端口占用错误：{lastError?.GetType().Name}: {lastError?.Message}\n" +
+                                 "该类错误与端口是否空闲无关，更换端口不会解决。请按下面方向排查：\n" +
+                                 "  ① 权限问题（UnauthorizedAccessException / ErrorCode 5 等）：确认当前 Windows 用户对监听地址有访问权，\n" +
+                                 "     一般无需配置；若改动过 URL 前缀 ACL，可用 netsh http show urlacl 检查。官方参考：\n" +
+                                 "     https://learn.microsoft.com/en-us/windows/win32/http/add-urlacl\n" +
+                                 "  ② 系统资源/网络栈问题（句柄耗尽、端口保留段被 Hyper-V/WSL2/Docker 占用等）：\n" +
+                                 "     检查 Windows 动态端口排除区是否覆盖了 8321~8576：netsh int ipv4 show excludedportrange protocol=tcp\n" +
+                                 "     官方排查手册：https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/tcp-ip-port-exhaustion-troubleshooting\n" +
+                                 "  ③ 若为防火墙/杀软拦截：放行 127.0.0.1 本地回环监听后重试。");
+            }
+            else if (WinErrorCode(lastError) == 32)
+            {
+                // ERROR_SHARING_VIOLATION：共享冲突——常见于同一地址已被另一实例/残留句柄独占，
+                // 与普通端口占用（10013）的解决方向不同，单独提示。
+                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用，且最后一次为共享冲突（ErrorCode 32，ERROR_SHARING_VIOLATION）：{lastError?.Message}\n" +
+                                 "共享冲突通常是“同一地址已存在另一个监听者”，请按下面方向排查：\n" +
+                                 "  ① 检查是否有其它 Unity 编辑器实例在跑（每个实例都会从 8321 起顺延占用端口，\n" +
+                                 "     同项目多实例还会互相覆盖端口文件）；确认后关闭多余实例重试；\n" +
+                                 "  ② 也可能是上次退出未释放的残留监听（服务异常退出导致句柄未释放），重启 Unity 编辑器即可；\n" +
+                                 "  ③ 仍不行再查占用进程：netstat -ano | findstr 8321，再 taskkill /PID <PID> /F。");
+            }
+            else
+            {
+                // 10013（WSAEACCES）等：最典型是端口确实被其他进程占用，或 URL ACL 拒绝绑定。
+                Debug.LogWarning($"[UnityBridge] 启动失败：端口 {DefaultPort}~{DefaultPort + PortAttempts - 1} 均被占用（最后一次错误码 {WinErrorCode(lastError)}：{lastError?.Message}）。\n" +
+                                 "请按下面方向排查：\n" +
+                                 "  ① 找出占用端口的进程并结束：netstat -ano | findstr 8321，再 taskkill /PID <PID> /F；\n" +
+                                 "     若 8321 空闲但 8322~8576 被占，把 8321 换成对应最小编号的占用端口再查；\n" +
+                                 "  ② 若端口段被 Windows 动态端口保留区占满（Hyper-V/WSL2/Docker 会保留整段端口）：\n" +
+                                 "     netsh int ipv4 show excludedportrange protocol=tcp 查看保留段，必要时重启以刷新保留表；\n" +
+                                 "  ③ 也可重启 Unity 编辑器重试（服务随编辑器启动自动顺延）。");
+            }
             Stop();
             return false;
         }
@@ -115,6 +158,13 @@ namespace UnityBridge
         {
             return ex is HttpListenerException hle &&
                    (hle.ErrorCode == 10013 || hle.ErrorCode == 32);
+        }
+
+        // 取 Windows 原生错误码（HttpListenerException.ErrorCode 即 Win32 码）；
+        // 非 HttpListenerException 时返回 -1，用于区分“端口占用”与“其它错误”。
+        private static int WinErrorCode(Exception ex)
+        {
+            return (ex as HttpListenerException)?.ErrorCode ?? -1;
         }
 
         // 尝试在指定端口启动监听；成功则写端口文件并挂接日志/更新回调。
