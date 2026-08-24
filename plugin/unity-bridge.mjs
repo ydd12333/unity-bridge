@@ -107,15 +107,91 @@ function readPortFile(portFile) {
   }
 }
 
+// 端口文件读取失败时，除了按会话目录找，还尝试这些候选目录。
+// Unity 项目与 DSH 会话目录未必一致（如从插件仓库开会话、会话是项目子目录等），
+// 一处读不到不代表端口文件不存在——多候选能覆盖更多实际布局。
+//
+// 候选生成规则（Windows）：
+//   1) cwd 自身（cwd 可能就是项目根或项目内部）；
+//   2) cwd 的每一级祖先（项目可能在会话目录的母目录，如会话在仓库子目录）；
+//   3) cwd 的所有同级目录（会话在插件仓库、Unity 项目是兄弟目录时，是唯一的命中路径）。
+//   路径一律不解析符号链接/大小写（端口文件在 Library 下，而读取时的 cwd 是实路径，
+//   Windows 大小写不敏感，File.existsSync 能命中），仅做 existsSync 探测，零成本。
+function portFileCandidates(cwd) {
+  if (!cwd) return []
+  const list = []
+  const add = (p) => {
+    if (p && !list.includes(p)) list.push(p)
+  }
+  // ① cwd 自身 + 逐级祖先（含盘符根到顶的防死循环保护）。
+  add(portFileForCwd(cwd))
+  for (let d = path.dirname(cwd); d && d !== cwd && d.length > 2; d = path.dirname(d)) {
+    add(portFileForCwd(d))
+    if (d.length <= 3) break // 盘符根（如 "D:\"）到顶
+  }
+  // ② 每个祖先层级的所有同级目录（会话在插件仓库、Unity 项目是兄弟目录时，
+  //    只有这里能命中项目根）。这里只遍历“祖先的父目录”，不重复祖先本身。
+  //    需要 readdir 的目录集合 = { cwd 各层祖先的父目录 }，去重后逐层扫描。
+  const parents = []
+  for (let d = cwd; d && d.length > 2; d = path.dirname(d)) {
+    const parent = path.dirname(d)
+    if (!parent || parent === d || parent.length <= 3) break
+    if (!parents.includes(parent)) parents.push(parent)
+  }
+  for (const parent of parents) {
+    let entries = []
+    try { entries = fs.readdirSync(parent, { withFileTypes: true }) } catch { continue }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue
+      add(portFileForCwd(path.join(parent, ent.name)))
+    }
+  }
+  return list.filter(Boolean)
+}
+
+// 按 projectPath 索引的端口发现缓存：findPortByHealth 命中后写入，
+// 后续请求直接命中缓存端口，避免每个请求都全范围扫描。
+const portDiscoveryCache = new Map()
+
+function cacheGet(cwd) {
+  if (!cwd) return undefined
+  const norm = normalizePath(cwd)
+  return portDiscoveryCache.get(norm)
+}
+
+function cachePut(cwd, port) {
+  if (!cwd || !port) return
+  portDiscoveryCache.set(normalizePath(cwd), port)
+}
+
+// 端口文件候选结果按 cwd 缓存（目录结构不会在会话期内变化），避免
+// waitCompileDone 每轮轮询都重建候选列表 + readdir 盘根目录的浪费。
+const portCandidatesCache = new Map()
+function cachedPortFileCandidates(cwd) {
+  if (!cwd) return []
+  const norm = normalizePath(cwd)
+  if (!portCandidatesCache.has(norm)) {
+    portCandidatesCache.set(norm, portFileCandidates(cwd))
+  }
+  return portCandidatesCache.get(norm)
+}
+
 // 从工具执行上下文取当前会话项目目录，据此定位对应的 Unity 实例。
+// 优先级：环境变量 UNITY_BRIDGE_PORT > 发现缓存 > 端口文件（多候选） > 固定端口 8321。
 function portForExec(exec) {
-  const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header
-    ? exec.agent.session.header.cwd
-    : undefined
+  const cwd = sessionCwd(exec)
   const envPort = parsePort(process.env.UNITY_BRIDGE_PORT)
   if (envPort) return envPort
-  const fromFile = readPortFile(portFileForCwd(cwd))
-  if (fromFile) return fromFile
+
+  // 发现缓存：之前扫描命中过的 { cwd → port }。
+  // 注意 cache 存的是“已确认能响应的端口”，比端口文件更可信（文件可能残留/被覆盖）。
+  const cached = cacheGet(cwd)
+  if (cached) return cached
+
+  for (const pf of cachedPortFileCandidates(cwd)) {
+    const fromFile = readPortFile(pf)
+    if (fromFile) return fromFile
+  }
   return DEFAULT_PORT
 }
 
@@ -192,33 +268,118 @@ function request(method, path, body, timeoutMs = DEFAULT_TIMEOUT_MS, signal, por
   })
 }
 
+// Unity 侧顺延参数镜像（与 com.yd.unitybridge/Editor/UnityBridgeServer.cs 保持一致）：
+// 首选 8321，被占时顺延最多 256 个端口（8321~8576）。
+const PORT_SCAN_START = DEFAULT_PORT
+const PORT_SCAN_COUNT = 256
+
 // 按当前会话项目目录发起请求（自动定位端口并携带取消信号）。
-// 端口文件指向的端口连不上时，回退尝试固定端口 DEFAULT_PORT——覆盖
-// “同一项目多实例时端口文件被覆盖”与“端口文件残留”两类场景。
-// 回退前先用短超时探测 /health，避免对无响应实例等满完整超时。
+// 端口定位优先级：UNITY_BRIDGE_PORT 环境变量 > 端口文件 > 固定端口 8321。
+// 主候选连不上时，主动扫描 Unity 侧允许的顺延端口范围（8321~8576），
+// 用 /health 探测找到实际监听的端口——覆盖“端口文件读不到/失效”时
+// Unity 已顺延到 8325 等非默认端口而 DSH 侧仍只试 8321 的失配问题。
+// 扫描按“最接近默认端口优先”顺序，避免连错同项目多实例。
 async function call(exec, method, path, body, timeoutMs) {
   const primary = portForExec(exec)
-  const fallback = process.env.UNITY_BRIDGE_PORT ? undefined : DEFAULT_PORT
-  // 分级超时：/health 探测请求用短超时（默认 30s 太长，服务无响应时逐个吞 30s 会拖垮整体）；
-  // 普通请求保持调用方指定超时，但对「黑洞端口」（握手成功但无响应）附加首字节上限。
+  const envPort = parsePort(process.env.UNITY_BRIDGE_PORT)
   const isHealth = path === '/health'
   const useTimeout = isHealth ? HEALTH_TIMEOUT_MS : (timeoutMs ?? DEFAULT_TIMEOUT_MS)
   const useFirstByte = isHealth ? true : Boolean(timeoutMs === undefined)
 
+  // 先试主候选（环境变量 / 端口文件 / 固定端口）。
   try {
     return await request(method, path, body, useTimeout, exec && exec.signal, primary, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
   } catch (err) {
-    if (fallback && fallback !== primary) {
-      // 短超时探测回退端口是否真的有响应，避免等满 timeoutMs。
-      try {
-        await request('GET', '/health', undefined, HEALTH_TIMEOUT_MS, exec && exec.signal, fallback, FIRST_BYTE_TIMEOUT_MS)
-      } catch {
-        throw err // 回退端口无响应，报主候选错误
-      }
-      return request(method, path, body, useTimeout, exec && exec.signal, fallback, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
+    // 环境变量显式指定时，用户意图明确，不扫描（避免扫描到别的实例端口）。
+    if (envPort) throw err
+
+    // 范围扫描：从 DEFAULT_PORT 起逐个探测 /health，找到有响应的端口即为 Unity 实际端口。
+    // 并发窗口 8，避免 256 个端口串行探测拖垮整体；命中即视为本次调用的目标端口。
+    const hit = await findPortByHealth(exec, PORT_SCAN_START, PORT_SCAN_COUNT, primary)
+    if (hit == null) throw err // 扫描不到任何响应端口，报主候选错误
+
+    if (hit !== primary) {
+      cachePut(sessionCwd(exec), hit)
+      await logOnce(`Unity Bridge 自动发现：端口 ${primary} 不可用，已定位到顺延端口 ${hit}（Unity 侧自动顺延所致）。后续请求将优先使用 ${hit}。`)
     }
-    throw err
+    return request(method, path, body, useTimeout, exec && exec.signal, hit, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
   }
+}
+
+// 探测端口范围（含 start，共 count 个），返回第一个 /health 有响应且**与参照匹配**的端口。
+// 内部用并发窗口逐批探测，任一命中即返回；全无响应返回 null。跳过 skipPort 不探测。
+// 短超时探测避免对黑洞/无响应端口等满完整超时。
+// 参照匹配优先级（hp = 探测端口实际 /health.projectPath 的规范化值）：
+//   ① 存在端口文件 r: r.projectRoot == hp 且 r.port == 探测端口 → 命中（最强证据：
+//      端口文件当前有效，数字与项目身份双向一致）；
+//   ② 存在端口文件 r: r.projectRoot == hp → 命中（端口文件数字可能过时/顺延过，
+//      但项目身份一致——该端口就是此项目实例当前实际监听端口）；
+//   ③ hp == cwd 规范化值 → 命中（会话就在该项目内）；
+//   ④ 无任何参照（无 cwd、无端口文件）→ 任一有响应的端口即命中（兜底可用性）。
+// 其它情况一律视为“别的实例”，跳过继续探测，避免多实例下连错项目。
+// 收集候选链中所有存在的端口文件参照。
+// 端口文件形如 <项目根>/Library/UnityBridgePort.txt，项目根 = 文件目录的父目录。
+// 返回 [{ port, projectRoot, file }, ...]；一个文件都没有返回 []。
+function portFileRefsFor(cwd) {
+  const refs = []
+  for (const pf of cachedPortFileCandidates(cwd)) {
+    const fromFile = readPortFile(pf)
+    if (!fromFile) continue
+    refs.push({
+      port: fromFile,
+      projectRoot: normalizePath(path.dirname(path.dirname(pf))),
+      file: pf,
+    })
+  }
+  return refs
+}
+
+async function findPortByHealth(exec, start, count, skipPort) {
+  const cwd = sessionCwd(exec)
+  const batchSize = 8
+  const ports = []
+  for (let i = 0; i < count; i++) {
+    const p = start + i
+    if (p === skipPort) continue
+    ports.push(p)
+  }
+  const refs = portFileRefsFor(cwd)
+  const normCwd = cwd ? normalizePath(cwd) : ''
+
+  for (let b = 0; b < ports.length; b += batchSize) {
+    const batch = ports.slice(b, b + batchSize)
+    const results = await Promise.all(batch.map(async (p) => {
+      try {
+        const h = await request('GET', '/health', undefined, HEALTH_TIMEOUT_MS, exec && exec.signal, p, FIRST_BYTE_TIMEOUT_MS)
+        const hp = h && h.projectPath ? normalizePath(h.projectPath) : ''
+        // 当前探测端口上实际托管的项目（hp），与端口文件参照的项目做身份比对：
+        const matchRefs = refs.filter((r) => hp && hp === r.projectRoot)
+        // ① 数字 + 项目身份双向一致 → 最强证据。
+        if (matchRefs.some((r) => r.port === p)) return p
+        // ② 项目身份一致（端口文件数字可能过时/顺延过，但项目是对的）→ 命中。
+        if (matchRefs.length) return p
+        // ③ 会话目录即该项目根 → 命中。
+        if (normCwd && hp && hp === normCwd) return p
+        // ④ 无任何参照 → 任一响应兜底。
+        if (!normCwd && !refs.length) return p
+        // 其余 → 这是别的项目实例，跳过。
+        return null
+      } catch {
+        return null
+      }
+    }))
+    const hit = results.find((p) => p != null)
+    if (hit != null) return hit
+  }
+  return null
+}
+
+// 只打印一次的全局标记：自动发现端口对用户来说是有价值的信息，但每个请求都打会刷屏。
+let loggedDiscovery = false
+function logOnce(msg) {
+  if (loggedDiscovery) return
+  loggedDiscovery = true
+  console.warn(`[unity-bridge] ${msg}`)
 }
 
 // 取当前会话项目目录（供 health 校验与错误提示使用）。
@@ -229,10 +390,16 @@ function sessionCwd(exec) {
 }
 
 // /health 且校验项目路径：兜底连错实例（多实例/端口文件失配）时立即报错。
+// 例外：某个端口文件（最权威来源）明确指向某项目，且 /health 返回的正是该项目时，
+// 即使与会话 cwd 不同也放行——覆盖“会话在插件仓库、Unity 项目是兄弟目录”的
+// 正常用法（此时端口文件已通过同级目录候选被发现）。
 async function healthChecked(exec) {
   const h = await call(exec, 'GET', '/health')
   const cwd = sessionCwd(exec)
-  if (cwd && h.projectPath && normalizePath(cwd) !== normalizePath(h.projectPath)) {
+  const hp = h.projectPath ? normalizePath(h.projectPath) : ''
+  const refs = portFileRefsFor(cwd)
+  const refMatches = refs.some((r) => hp && hp === r.projectRoot)
+  if (cwd && hp && normalizePath(cwd) !== hp && !refMatches) {
     throw new Error(
       `项目不匹配：当前会话目录 ${cwd} 与 Unity 实例项目 ${h.projectPath} 不一致（端口文件指向其他实例或选错项目）。\n` +
       `解决方法：① 在目标项目目录（${h.projectPath}）下新建 DSH 会话，或将会话工作目录切到该项目目录；` +
