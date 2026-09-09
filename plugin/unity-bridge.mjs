@@ -107,6 +107,40 @@ function readPortFile(portFile) {
   }
 }
 
+// 把字符串解析成合法进程号（1~2^31-1），非法返回 undefined。UNITY_BRIDGE_PID 钉选用。
+function parsePid(value) {
+  if (value === undefined || value === null || value === '') return undefined
+  const pid = Number(value)
+  return Number.isInteger(pid) && pid > 0 && pid < 2147483648 ? pid : undefined
+}
+
+// 读取端口文件条目。主文件 <项目根>/Library/UnityBridgePort.txt 为纯数字端口；
+// Unity 侧同时写 JSON 边车 <项目根>/Library/UnityBridgePort.json
+// （{ port, pid, project, projectPath, startTimeUtc }），供多实例身份校验与诊断。
+// 仅当边车 port 与主文件一致时才采信边车 pid——主文件可能被后启动的另一实例
+// 覆盖（同项目多实例共享 Library），数字一致说明边车与主文件同源，pid 才可信。
+// 返回 null（读不到）或 { port, file, projectRoot, rawRoot, pid?, startTimeUtc? }。
+function readPortFileEntry(portFile) {
+  const port = readPortFile(portFile)
+  if (!port) return null
+  const projectRoot = path.dirname(path.dirname(portFile))
+  const entry = {
+    port,
+    file: portFile,
+    projectRoot: normalizePath(projectRoot),
+    rawRoot: projectRoot, // 原样路径（未规范化），用于用户可读的错误提示
+  }
+  try {
+    const meta = JSON.parse(fs.readFileSync(portFile.replace(/\.txt$/i, '.json'), 'utf8'))
+    if (Number(meta.port) === port) {
+      const pid = parsePid(meta.pid)
+      if (pid) entry.pid = pid
+      if (typeof meta.startTimeUtc === 'string' && meta.startTimeUtc) entry.startTimeUtc = meta.startTimeUtc
+    }
+  } catch { /* 无 JSON 边车或解析失败：仅主文件数字可用，pid 未知 */ }
+  return entry
+}
+
 // 端口文件读取失败时，除了按会话目录找，还尝试这些候选目录。
 // Unity 项目与 DSH 会话目录未必一致（如从插件仓库开会话、会话是项目子目录等），
 // 一处读不到不代表端口文件不存在——多候选能覆盖更多实际布局。
@@ -177,7 +211,10 @@ function cachedPortFileCandidates(cwd) {
 }
 
 // 从工具执行上下文取当前会话项目目录，据此定位对应的 Unity 实例。
-// 优先级：环境变量 UNITY_BRIDGE_PORT > 发现缓存 > 端口文件（多候选） > 固定端口 8321。
+// 优先级：UNITY_BRIDGE_PORT 环境变量 > 发现缓存 > 意图项目端口文件 > 固定端口 8321。
+// “意图项目”= intendedRootFor 的结果：会话目录所在项目 / 唯一可连项目 / UNITY_BRIDGE_PROJECT。
+// 只信任属于意图项目的端口文件作为主候选——兄弟项目残留的端口文件（如"另一个编辑器
+// 项目"的 Library/UnityBridgePort.txt）不参与主候选，杜绝主候选本身就指向别的实例。
 function portForExec(exec) {
   const cwd = sessionCwd(exec)
   const envPort = parsePort(process.env.UNITY_BRIDGE_PORT)
@@ -188,9 +225,10 @@ function portForExec(exec) {
   const cached = cacheGet(cwd)
   if (cached) return cached
 
-  for (const pf of cachedPortFileCandidates(cwd)) {
-    const fromFile = readPortFile(pf)
-    if (fromFile) return fromFile
+  const refs = portFileRefsFor(cwd)
+  const intended = intendedRootFor(cwd, refs)
+  for (const r of refs) {
+    if (r.port && (!intended || r.projectRoot === intended)) return r.port
   }
   return DEFAULT_PORT
 }
@@ -274,104 +312,189 @@ const PORT_SCAN_START = DEFAULT_PORT
 const PORT_SCAN_COUNT = 256
 
 // 按当前会话项目目录发起请求（自动定位端口并携带取消信号）。
-// 端口定位优先级：UNITY_BRIDGE_PORT 环境变量 > 端口文件 > 固定端口 8321。
+// 端口定位优先级：UNITY_BRIDGE_PORT 环境变量 > 发现缓存 > 意图项目端口文件 > 固定端口 8321。
 // 主候选连不上时，主动扫描 Unity 侧允许的顺延端口范围（8321~8576），
-// 用 /health 探测找到实际监听的端口——覆盖“端口文件读不到/失效”时
-// Unity 已顺延到 8325 等非默认端口而 DSH 侧仍只试 8321 的失配问题。
-// 扫描按“最接近默认端口优先”顺序，避免连错同项目多实例。
+// 用 /health 探测并按“意图项目身份”找到实际监听的端口——覆盖“端口文件被其他实例
+// 覆盖/残留/失效”时 Unity 实际端口与端口文件不一致的失配，且绝不连到别的项目实例。
 async function call(exec, method, path, body, timeoutMs) {
-  const primary = portForExec(exec)
+  const cwd = sessionCwd(exec)
   const envPort = parsePort(process.env.UNITY_BRIDGE_PORT)
   const isHealth = path === '/health'
   const useTimeout = isHealth ? HEALTH_TIMEOUT_MS : (timeoutMs ?? DEFAULT_TIMEOUT_MS)
   const useFirstByte = isHealth ? true : Boolean(timeoutMs === undefined)
 
-  // 先试主候选（环境变量 / 端口文件 / 固定端口）。
+  // 多项目歧义前置拦截（覆盖全部工具，含未做 healthChecked 的 unity_logs/unity_mcp 等）：
+  // 会话目录不在任何可连项目内、又有多个项目可连时，禁止静默猜测目标实例。
+  if (!envPort) {
+    const refs = portFileRefsFor(cwd)
+    const ambiguous = ambiguityFor(cwd, refs)
+    if (ambiguous) throw new Error(ambiguous)
+  }
+
+  const primary = portForExec(exec)
+
+  // 命中目标端口后执行实际请求；UNITY_BRIDGE_PID 钉选时先做一次实例身份校验。
+  const run = async (port) => {
+    if (!isHealth) await assertPid(exec, port)
+    return request(method, path, body, useTimeout, exec && exec.signal, port, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
+  }
+
+  // 先试主候选（环境变量 / 发现缓存 / 意图项目端口文件 / 固定端口）。
   try {
-    return await request(method, path, body, useTimeout, exec && exec.signal, primary, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
+    return await run(primary)
   } catch (err) {
     // 环境变量显式指定时，用户意图明确，不扫描（避免扫描到别的实例端口）。
     if (envPort) throw err
 
-    // 范围扫描：从 DEFAULT_PORT 起逐个探测 /health，找到有响应的端口即为 Unity 实际端口。
-    // 并发窗口 8，避免 256 个端口串行探测拖垮整体；命中即视为本次调用的目标端口。
+    // 范围扫描：从 DEFAULT_PORT 起按“意图项目身份”探测 /health。
+    // 并发窗口内逐批探测，命中即视为本次调用的目标端口。
     const hit = await findPortByHealth(exec, PORT_SCAN_START, PORT_SCAN_COUNT, primary)
-    if (hit == null) throw err // 扫描不到任何响应端口，报主候选错误
+    if (hit == null) throw err // 扫描不到身份匹配的响应端口，报主候选错误
 
     if (hit !== primary) {
-      cachePut(sessionCwd(exec), hit)
-      await logOnce(`Unity Bridge 自动发现：端口 ${primary} 不可用，已定位到顺延端口 ${hit}（Unity 侧自动顺延所致）。后续请求将优先使用 ${hit}。`)
+      cachePut(cwd, hit)
+      await logOnce(`Unity Bridge 自动发现：端口 ${primary} 不可用/不属于目标项目，已定位到 ${hit}（端口文件可能被其他实例覆盖或残留）。后续请求将优先使用 ${hit}。`)
     }
-    return request(method, path, body, useTimeout, exec && exec.signal, hit, useFirstByte ? FIRST_BYTE_TIMEOUT_MS : undefined)
+    return run(hit)
   }
 }
 
-// 探测端口范围（含 start，共 count 个），返回第一个 /health 有响应且**与参照匹配**的端口。
-// 内部用并发窗口逐批探测，任一命中即返回；全无响应返回 null。跳过 skipPort 不探测。
-// 短超时探测避免对黑洞/无响应端口等满完整超时。
-// 参照匹配优先级（hp = 探测端口实际 /health.projectPath 的规范化值）：
-//   ① 存在端口文件 r: r.projectRoot == hp 且 r.port == 探测端口 → 命中（最强证据：
-//      端口文件当前有效，数字与项目身份双向一致）；
-//   ② 存在端口文件 r: r.projectRoot == hp → 命中（端口文件数字可能过时/顺延过，
-//      但项目身份一致——该端口就是此项目实例当前实际监听端口）；
-//   ③ hp == cwd 规范化值 → 命中（会话就在该项目内）；
-//   ④ 无任何参照（无 cwd、无端口文件）→ 任一有响应的端口即命中（兜底可用性）。
-// 其它情况一律视为“别的实例”，跳过继续探测，避免多实例下连错项目。
-// 收集候选链中所有存在的端口文件参照。
-// 端口文件形如 <项目根>/Library/UnityBridgePort.txt，项目根 = 文件目录的父目录。
-// 返回 [{ port, projectRoot, file }, ...]；一个文件都没有返回 []。
+// ── 意图项目判定与端口发现（多实例/多会话路由核心）────────────────────────
+
+// 收集候选链中所有存在的端口文件参照（含 JSON 边车的 pid）。
+// 端口文件形如 <项目根>/Library/UnityBridgePort.txt（另有 .json 边车），
+// 项目根 = 文件目录的父目录。返回 [{ port, file, projectRoot, rawRoot, pid?, ... }, ...]；
+// 一个文件都没有返回 []。
 function portFileRefsFor(cwd) {
   const refs = []
   for (const pf of cachedPortFileCandidates(cwd)) {
-    const fromFile = readPortFile(pf)
-    if (!fromFile) continue
-    refs.push({
-      port: fromFile,
-      projectRoot: normalizePath(path.dirname(path.dirname(pf))),
-      file: pf,
-    })
+    const entry = readPortFileEntry(pf)
+    if (entry) refs.push(entry)
   }
   return refs
 }
 
+// 判定会话“意图项目根”（规范化小写绝对路径；'' = 无法唯一确定）。优先级：
+//   ① 环境变量 UNITY_BRIDGE_PROJECT（会话不在任何项目内时精确指定目标项目）；
+//   ② 覆盖会话目录的端口文件参照（cwd == 项目根 或 cwd 在项目根之下）→ 取最深覆盖者
+//      （会话目录是项目内任意子目录时仍归到项目根）；
+//   ③ 参照去重后只剩 1 个项目根 → 该项目（“会话在插件仓库、唯一项目在兄弟目录”场景）；
+//   ④ 否则 ''——多个不同项目并存且会话不在其中任一内 → 歧义，调用方必须拒绝静默选择。
+function intendedRootFor(cwd, refs) {
+  const envProject = normalizePath(process.env.UNITY_BRIDGE_PROJECT)
+  if (envProject) return envProject
+  const normCwd = cwd ? normalizePath(cwd) : ''
+  if (!normCwd) return ''
+  const covering = refs
+    .filter((r) => normCwd === r.projectRoot || normCwd.startsWith(r.projectRoot + '\\'))
+    .sort((a, b) => b.projectRoot.length - a.projectRoot.length)
+  if (covering.length) return covering[0].projectRoot
+  const uniqueRoots = []
+  for (const r of refs) {
+    if (r.projectRoot && !uniqueRoots.includes(r.projectRoot)) uniqueRoots.push(r.projectRoot)
+  }
+  return uniqueRoots.length === 1 ? uniqueRoots[0] : ''
+}
+
+// 多项目歧义检查：返回需要报给用户的说明（'' = 无歧义）。
+// 会话目录不在任何可连项目内、且端口文件参照指向 ≥2 个不同项目 → 歧义，
+// 此时无法从目录推断目标，绝不允许静默挑一个（那正是“连错编辑器”的根源）。
+// 例外：设置了 UNITY_BRIDGE_PID 时 pid 本身就是实例级唯一标识，无歧义；
+// 设置了 UNITY_BRIDGE_PROJECT 时由 intendedRootFor 直接确定目标，同样无歧义。
+function ambiguityFor(cwd, refs) {
+  if (!cwd) return ''
+  if (parsePid(process.env.UNITY_BRIDGE_PID)) return ''
+  if (intendedRootFor(cwd, refs)) return ''
+  const roots = []
+  for (const r of refs) {
+    const rr = r.rawRoot || r.projectRoot
+    if (rr && !roots.includes(rr)) roots.push(rr)
+  }
+  if (roots.length < 2) return ''
+  return (
+    `检测到多个 Unity 项目可连接（${roots.join('、')}），而当前会话目录 ${cwd} 不在其中任何一个项目内，` +
+    `无法判断本会话应操作哪个编辑器，已拒绝自动选择以免连错实例。\n` +
+    `解决方法：① 在目标 Unity 项目目录下新建 DSH 会话，或把本会话工作目录切到目标项目；` +
+    `② 设置环境变量 UNITY_BRIDGE_PROJECT=<目标项目绝对路径>（如 d:\\unity\\island\\islandclient）后重试；` +
+    `③ 或设置 UNITY_BRIDGE_PORT=<端口> 直连目标实例。`
+  )
+}
+
+// 探测端口范围（含 start，共 count 个），返回“身份匹配”的端口；全无返回 null。
+// 跳过 skipPort 不探测。内部用并发窗口逐批探测，短超时（SCAN_PROBE_*）避免对
+// “TCP 可连但永不响应”的僵尸/卡死实例（batchmode 残留、主线程被阻塞等）等满完整超时。
+// 身份匹配优先级（h = 探测端口实际 /health；hp = h.projectPath 规范化值；pid = h.pid）：
+//   ① UNITY_BRIDGE_PID 钉选：h.pid == 钉选 pid → 立即命中（用户显式指定具体实例进程）；
+//   ② 命中会话“意图项目”的实例（hp == intendedRoot）→ 命中；其中端口文件的 pid 与
+//      实例 pid 一致（rank 0，端口文件直指该实例）比仅项目一致（rank 1）证据更强；
+//   ③ 无任何参照且无会话目录 → 任一有响应端口兜底（老用法）。
+// 其它情况（hp 属于别的项目/别的实例）一律跳过，杜绝多实例下连错项目——
+// 这是修复“两个编辑器 + 两个会话互相连错”的关键：兄弟项目的端口文件只能用来
+// 识别“存在哪些项目”，绝不能当作本会话目标项目的匹配依据。
+const SCAN_BATCH_SIZE = 8
+const SCAN_PROBE_TIMEOUT_MS = 2500
 async function findPortByHealth(exec, start, count, skipPort) {
   const cwd = sessionCwd(exec)
-  const batchSize = 8
+  const refs = portFileRefsFor(cwd)
+  const normCwd = cwd ? normalizePath(cwd) : ''
+  const intended = intendedRootFor(cwd, refs)
+  const pinPid = parsePid(process.env.UNITY_BRIDGE_PID)
   const ports = []
   for (let i = 0; i < count; i++) {
     const p = start + i
     if (p === skipPort) continue
     ports.push(p)
   }
-  const refs = portFileRefsFor(cwd)
-  const normCwd = cwd ? normalizePath(cwd) : ''
-
-  for (let b = 0; b < ports.length; b += batchSize) {
-    const batch = ports.slice(b, b + batchSize)
+  let best = null // { rank, port }，rank 越小证据越强
+  const consider = (rank, p) => {
+    if (!best || rank < best.rank || (rank === best.rank && p < best.port)) best = { rank, port: p }
+  }
+  for (let b = 0; b < ports.length; b += SCAN_BATCH_SIZE) {
+    const batch = ports.slice(b, b + SCAN_BATCH_SIZE)
     const results = await Promise.all(batch.map(async (p) => {
       try {
-        const h = await request('GET', '/health', undefined, HEALTH_TIMEOUT_MS, exec && exec.signal, p, FIRST_BYTE_TIMEOUT_MS)
+        const h = await request('GET', '/health', undefined, SCAN_PROBE_TIMEOUT_MS, exec && exec.signal, p, SCAN_PROBE_TIMEOUT_MS)
         const hp = h && h.projectPath ? normalizePath(h.projectPath) : ''
-        // 当前探测端口上实际托管的项目（hp），与端口文件参照的项目做身份比对：
-        const matchRefs = refs.filter((r) => hp && hp === r.projectRoot)
-        // ① 数字 + 项目身份双向一致 → 最强证据。
-        if (matchRefs.some((r) => r.port === p)) return p
-        // ② 项目身份一致（端口文件数字可能过时/顺延过，但项目是对的）→ 命中。
-        if (matchRefs.length) return p
-        // ③ 会话目录即该项目根 → 命中。
-        if (normCwd && hp && hp === normCwd) return p
-        // ④ 无任何参照 → 任一响应兜底。
-        if (!normCwd && !refs.length) return p
-        // 其余 → 这是别的项目实例，跳过。
+        const pid = h && h.pid ? Number(h.pid) : 0
+        // ① pid 钉选：实例级精确命中。
+        if (pinPid && pid && pid === pinPid) return { pin: true, p }
+        // ② 意图项目命中（intended 优先于裸会话目录：目录不在项目内时用唯一项目/环境变量判定）。
+        const target = intended || normCwd
+        if (target && hp && hp === target) {
+          const exact = refs.some((r) => r.projectRoot === target && r.port === p && r.pid && pid && r.pid === pid)
+          return { rank: exact ? 0 : 1, p }
+        }
+        // ③ 无任何参照且无会话目录 → 任一响应兜底（老用法）。
+        if (!normCwd && !refs.length) return { rank: 2, p }
+        // 其余 → 别的项目/别的实例，跳过。
         return null
       } catch {
         return null
       }
     }))
-    const hit = results.find((p) => p != null)
-    if (hit != null) return hit
+    const pinned = results.find((r) => r != null && r.pin)
+    if (pinned) return pinned.p
+    for (const r of results) {
+      if (r != null && !r.pin) consider(r.rank, r.p)
+    }
   }
-  return null
+  return best ? best.port : null
+}
+
+// UNITY_BRIDGE_PID 钉选校验：向目标端口发出实际业务请求前，先确认该端口上的
+// Unity 实例进程号与钉选一致（同一项目开多个编辑器、或编辑器重启后端口被复用时的
+// 最后一道保险）。
+async function assertPid(exec, port) {
+  const pinPid = parsePid(process.env.UNITY_BRIDGE_PID)
+  if (!pinPid) return
+  const h = await request('GET', '/health', undefined, HEALTH_TIMEOUT_MS, exec && exec.signal, port, FIRST_BYTE_TIMEOUT_MS)
+  const pid = h && h.pid ? Number(h.pid) : 0
+  if (pid !== pinPid) {
+    throw new Error(
+      `UNITY_BRIDGE_PID 校验失败：端口 ${port} 上的 Unity 实例进程号为 ${pid || '未知'}，与指定的 ${pinPid} 不一致。` +
+      `目标实例可能已重启/换端口，或该端口已被其他实例占用。请先调用 unity_health 确认目标实例的 pid 后重试。`
+    )
+  }
 }
 
 // 只打印一次的全局标记：自动发现端口对用户来说是有价值的信息，但每个请求都打会刷屏。
@@ -390,24 +513,43 @@ function sessionCwd(exec) {
 }
 
 // /health 且校验项目路径：兜底连错实例（多实例/端口文件失配）时立即报错。
-// 例外：某个端口文件（最权威来源）明确指向某项目，且 /health 返回的正是该项目时，
-// 即使与会话 cwd 不同也放行——覆盖“会话在插件仓库、Unity 项目是兄弟目录”的
-// 正常用法（此时端口文件已通过同级目录候选被发现）。
+// 判定“允许”的三种情况：
+//   A. /health 项目 == 会话目录（会话就在该项目内）；
+//   B. /health 项目 == 意图项目 intendedRoot（会话在插件仓库、唯一项目在兄弟目录，
+//      或通过 UNITY_BRIDGE_PROJECT 指定的正常用法）；
+//   C. UNITY_BRIDGE_PID 钉选命中（同项目多实例时按进程号精确定位）。
+// 不再有“任意端口文件参照匹配即放行”的宽松通道——兄弟项目的端口文件不能为
+// 连到别的项目开绿灯。
 async function healthChecked(exec) {
-  const h = await call(exec, 'GET', '/health')
   const cwd = sessionCwd(exec)
-  const hp = h.projectPath ? normalizePath(h.projectPath) : ''
   const refs = portFileRefsFor(cwd)
-  const refMatches = refs.some((r) => hp && hp === r.projectRoot)
-  if (cwd && hp && normalizePath(cwd) !== hp && !refMatches) {
-    throw new Error(
-      `项目不匹配：当前会话目录 ${cwd} 与 Unity 实例项目 ${h.projectPath} 不一致（端口文件指向其他实例或选错项目）。\n` +
-      `解决方法：① 在目标项目目录（${h.projectPath}）下新建 DSH 会话，或将会话工作目录切到该项目目录；` +
-      `② 或设置环境变量 UNITY_BRIDGE_PORT=<端口> 指向目标实例对应的监听端口后重试。\n` +
-      `若您确实想在本会话操作该项目，可忽略本错误直接使用不校验项目的其它 unity_* 工具。`
-    )
+  const h = await call(exec, 'GET', '/health')
+  const normCwd = cwd ? normalizePath(cwd) : ''
+  const hp = h && h.projectPath ? normalizePath(h.projectPath) : ''
+  const pid = h && h.pid ? Number(h.pid) : 0
+  const pinPid = parsePid(process.env.UNITY_BRIDGE_PID)
+
+  const intended = intendedRootFor(cwd, refs)
+  if (normCwd && hp && hp === normCwd) return h // A：会话就在该项目内
+  if (intended && hp && hp === intended) return h // B：意图项目
+  if (pinPid && pid && pid === pinPid) return h // C：pid 钉选
+  if (!normCwd && !refs.length) return h // 无任何参照（老用法兜底）
+
+  const roots = []
+  for (const r of refs) {
+    const rr = r.rawRoot || r.projectRoot
+    if (rr && !roots.includes(rr)) roots.push(rr)
   }
-  return h
+  throw new Error(
+    `项目不匹配：当前会话目录 ${cwd || '(未设置)'} 与 Unity 实例项目 ${h.projectPath || '(未知)'} 不一致` +
+    (roots.length ? `（已检测到可连接的 Unity 项目：${roots.join('、')}）` : '') +
+    `。可能原因：端口文件被其他实例覆盖/残留、会话工作目录选错、或连到了非目标实例。\n` +
+    `解决方法：① 在目标 Unity 项目目录下新建 DSH 会话，或把本会话工作目录切到该项目目录；` +
+    `② 设置环境变量 UNITY_BRIDGE_PROJECT=<目标项目绝对路径> 后重试；` +
+    `③ 或设置 UNITY_BRIDGE_PORT=<端口> 直连目标实例（同一项目开了多个编辑器时再附加 ` +
+    `UNITY_BRIDGE_PID=<进程号> 精确指定实例）。\n` +
+    `若您确实想在本会话操作当前已连上的项目，可忽略本错误直接使用其它 unity_* 工具。`
+  )
 }
 
 // 轮询直到编译结束。
@@ -684,4 +826,22 @@ export function apply(ctx) {
       }
       return data
     })
+}
+
+// 内部逻辑导出：仅供仓库自测/调试（scripts/ 下的测试脚本与故障复现用），
+// DSH 运行时只消费 apply/name/inject，额外的具名导出无副作用。
+export const _internals = {
+  normalizePath,
+  parsePort,
+  parsePid,
+  readPortFile,
+  readPortFileEntry,
+  portFileCandidates,
+  cachedPortFileCandidates,
+  portFileRefsFor,
+  intendedRootFor,
+  ambiguityFor,
+  sessionCwd,
+  portForExec,
+  findPortByHealth,
 }

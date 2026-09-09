@@ -9,9 +9,11 @@
 //   端口排除区（Hyper-V/WSL2/Docker 保留段）导致整段端口不可用。
 //   首选端口被占用时自动顺延（最多 PortAttempts 个端口），因此同一项目
 //   多实例、或端口被其他程序占用时都能启动成功。
-//   实际监听端口写入 <项目根>/Library/UnityBridgePort.txt（git 忽略），
-//   DSH 侧优先读该文件动态发现端口；读不到时回退固定端口 DefaultPort。
-//   /health 额外返回项目路径供 DSH 做交叉校验兜底。
+//   实际监听端口写入 <项目根>/Library/UnityBridgePort.txt（git 忽略，纯数字），
+//   并写 JSON 边车 UnityBridgePort.json（{port,pid,project,projectPath,startTimeUtc}），
+//   供 DSH 侧在多实例场景校验“该文件是哪个实例写的”。
+//   DSH 侧优先读端口文件动态发现端口；读不到时回退固定端口 DefaultPort。
+//   /health 额外返回项目路径与进程号供 DSH 做交叉校验兜底。
 //
 // 设计要点：
 //  - HttpListener 后台线程接收请求，Unity Editor API 一律通过主线程队列执行，
@@ -61,6 +63,10 @@ namespace UnityBridge
         private static readonly string StartTimeUtc = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'");
         // 实际端口写入 Library/UnityBridgePort.txt，供 DSH 侧动态发现。
         private static readonly string PortFile = Path.Combine(ProjectRoot, "Library", "UnityBridgePort.txt");
+        // JSON 身份边车：{ port, pid, project, projectPath, startTimeUtc, host }。
+        // 同项目多实例共享 Library，端口文件会被“后启动的实例”覆盖——pid 让 DSH 侧
+        // 能判断文件是否由当前存活实例所写，避免把残留文件当权威。
+        private static readonly string PortFileJson = Path.Combine(ProjectRoot, "Library", "UnityBridgePort.json");
 
         // 日志环形缓冲，主线程写入，读取时加锁快照。
         private const int MaxLogCount = 500;
@@ -231,19 +237,35 @@ namespace UnityBridge
             }
         }
 
-        // 把实际监听端口写入 Library/UnityBridgePort.txt（Library 已被 git 忽略，不进版本库）。
-        // 先写临时文件再原子替换，避免 DSH 侧读到写入一半的内容。
+        // 把实际监听端口写入 Library/UnityBridgePort.txt（纯数字，Library 已被 git 忽略），
+        // 并写 JSON 身份边车 UnityBridgePort.json（{port,pid,project,projectPath,startTimeUtc}）。
+        // 均先写临时文件再原子替换，避免 DSH 侧读到写入一半的内容。
         private static void WritePortFile(int port)
         {
             try
             {
                 var dir = Path.GetDirectoryName(PortFile);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
                 var tmp = PortFile + ".tmp";
                 File.WriteAllText(tmp, port.ToString());
                 // .NET Framework 的 File.Move 无 overwrite 参数：先删旧文件再移动。
                 if (File.Exists(PortFile)) File.Delete(PortFile);
                 File.Move(tmp, PortFile);
+
+                var meta = new
+                {
+                    port,
+                    pid = System.Diagnostics.Process.GetCurrentProcess().Id,
+                    project = Application.productName,
+                    projectPath = ProjectPath,
+                    startTimeUtc = StartTimeUtc,
+                    host = "127.0.0.1",
+                };
+                var jsonTmp = PortFileJson + ".tmp";
+                File.WriteAllText(jsonTmp, JsonConvert.SerializeObject(meta, Formatting.None));
+                if (File.Exists(PortFileJson)) File.Delete(PortFileJson);
+                File.Move(jsonTmp, PortFileJson);
             }
             catch (Exception ex)
             {
@@ -270,6 +292,10 @@ namespace UnityBridge
 
         private static void DeletePortFile()
         {
+            // 同项目多实例共享 Library/UnityBridgePort.txt：文件可能已被“后启动的另一实例”
+            // 覆盖（其 pid 记录在 JSON 边车里）。本实例停止时只清理属于自己的端口文件，
+            // 不能把仍在运行的其他实例的端口信息删掉。
+            if (!OwnsPortFile()) return;
             try
             {
                 if (File.Exists(PortFile)) File.Delete(PortFile);
@@ -277,6 +303,31 @@ namespace UnityBridge
             catch (Exception ex)
             {
                 Debug.LogWarning($"[UnityBridge] 删除端口文件失败（{PortFile}）：{ex.Message}");
+            }
+            try
+            {
+                if (File.Exists(PortFileJson)) File.Delete(PortFileJson);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[UnityBridge] 删除端口文件失败（{PortFileJson}）：{ex.Message}");
+            }
+        }
+
+        // 端口文件当前是否归本进程所有：JSON 边车记录的 pid 为空/缺失/等于本进程
+        // pid 时视为本进程所有（旧版本只写数字文件，没有边车 → 保守视为本进程所有）。
+        private static bool OwnsPortFile()
+        {
+            try
+            {
+                if (!File.Exists(PortFileJson)) return true;
+                var meta = JObject.Parse(File.ReadAllText(PortFileJson));
+                var pid = meta["pid"]?.Value<int>() ?? 0;
+                return pid == 0 || pid == System.Diagnostics.Process.GetCurrentProcess().Id;
+            }
+            catch
+            {
+                return true;
             }
         }
 

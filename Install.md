@@ -99,9 +99,10 @@ MCP for Unity 更久）。此阶段：
 | 现象 | 原因与处理 |
 |---|---|
 | `unity_health` 连接失败 | Unity 未打开 / UPM 包未装 / 仍在编译。确认编辑器运行中且第 2、3 步已完成 |
-| 报“项目不匹配” | 会话目录 ≠ Unity 实例项目。在目标项目目录开会话 |
+| 报“项目不匹配”或“检测到多个 Unity 项目可连接…” | 会话目录 ≠ 目标实例项目。在目标项目目录开会话；若会话目录不便切换，设环境变量 `UNITY_BRIDGE_PROJECT=<项目绝对路径>`（或 `UNITY_BRIDGE_PORT=<端口>`）后重试 |
+| 同时开着多个 Unity 编辑器、多个 DSH 会话互相连错 | 会话按工作目录自动路由到对应项目：把每个会话的工作目录切到各自目标项目即可。若端口文件被其他（含无窗口/残留）实例覆盖（文件端口 ≠ 编辑器打印端口），插件会扫描并按项目身份纠正。同一项目开了多个编辑器时，用 `UNITY_BRIDGE_PID=<进程号>` 按实例精确指定（`/health` 的 `pid` 即实例进程号） |
 | `unity_health` 正常但 `unity_mcp_catalog` 失败 | MCP for Unity 未随包解析成功；回 Unity 看 Package Manager 是否报错 |
-| 端口占用 | 8321 被占自动顺延（最多 256 个端口 8321~8576）。DSH 侧会读 `<项目>/Library/UnityBridgePort.txt` 动态发现实际端口；若端口文件读不到（如会话不在项目目录）或内容过时，还会自动扫描顺延端口段并按项目身份定位正确实例。试到全部端口失败时 Unity Console 警告区分两类：① 256 个端口全被占（`netstat`/`taskkill` 结束占用进程；检查 Hyper-V/WSL2/Docker 保留区 `netsh int ipv4 show excludedportrange protocol=tcp`；关多余 Unity 实例/重启编辑器）；② 权限或系统资源问题（换端口无效，附官方文档链接） |
+| 端口占用 | 8321 被占自动顺延（最多 256 个端口 8321~8576）。DSH 侧会读 `<项目>/Library/UnityBridgePort.txt`（及 JSON 边车）动态发现实际端口；若端口文件读不到（如会话不在项目目录）或内容过时/被覆盖，还会自动扫描顺延端口段并按项目身份定位正确实例。试到全部端口失败时 Unity Console 警告区分两类：① 256 个端口全被占（`netstat`/`taskkill` 结束占用进程；检查 Hyper-V/WSL2/Docker 保留区 `netsh int ipv4 show excludedportrange protocol=tcp`；关多余 Unity 实例/重启编辑器）；② 权限或系统资源问题（换端口无效，附官方文档链接） |
 | 服务启动失败 | Unity Console 应显示 `[UnityBridge] 已启动` 或具体异常；把报错信息转给用户排查 |
 | bridge 全部超时（含 `/health`） | 大概率是刚才通过菜单/静态方法触发了**模态对话框**（如某些 Status/Stop 类菜单，本包已移除自己的弹窗菜单），阻塞了 Unity 主线程。无法自动关闭——请用户到 Unity 窗口手动点掉对话框后恢复。**以后不要通过 bridge 调用任何会弹窗的交互式菜单** |
 

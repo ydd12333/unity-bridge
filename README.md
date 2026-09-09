@@ -63,12 +63,20 @@ dsh plugin --profile web add .
 
 工具：`unity_health` / `unity_compile` / `unity_refresh` / `unity_logs` / `unity_execute` / `unity_scene_open` / `unity_asset_get` / `unity_mcp_catalog` / `unity_mcp`
 
-端口规则：
-- 默认 `127.0.0.1:8321`，被占用自动顺延；实际端口写 `<项目>/Library/UnityBridgePort.txt`
-- DSH 侧端口发现优先级：`UNITY_BRIDGE_PORT` 环境变量 > 发现缓存 > 端口文件（自动扫描
-  会话目录、其各级祖先、以及所有同级目录，覆盖"在插件仓库开会话、Unity 项目在兄弟目录"）> 固定端口
-- 端口文件读不到/失效（内容过时、文件残留）时，自动对 8321~8576 发起 `/health` 扫描，
-  按**项目身份**（/health.projectPath 与端口文件归属项目一致）定位正确实例，避免多实例连错
+端口规则（多编辑器 / 多会话自动路由）：
+- 默认 `127.0.0.1:8321`，被占用自动顺延；实际端口写 `<项目>/Library/UnityBridgePort.txt`，
+  另写 JSON 边车 `UnityBridgePort.json`（含 pid / 项目身份，供多实例场景校验"文件是谁写的"）
+- 每个 DSH 会话按其**工作目录**定位目标 Unity 实例（意图项目判定，多会话各连各的编辑器）：
+  - 会话目录在项目内（含项目任意子目录）→ 操作该项目；
+  - 会话目录在别处（如插件仓库）但只有 1 个可连项目 → 操作该项目；
+  - 会话目录在别处且有多个可连项目 → **拒绝猜测并报错**（避免连错实例），可用下面任一方式指定：
+    - `UNITY_BRIDGE_PROJECT=<项目绝对路径>` —— 按项目指定目标；
+    - `UNITY_BRIDGE_PORT=<端口>` —— 按端口直连（先 `unity_health` 确认目标端口）；
+    - `UNITY_BRIDGE_PID=<进程号>` —— 同一项目开了多个编辑器时，按实例进程号精确指定
+      （`/health` 返回的 `pid` 即为当前实例进程号）
+- 端口文件被其他实例覆盖 / 残留（文件端口 ≠ 编辑器实际打印端口）时，自动对 8321~8576
+  发起 `/health` 扫描，并**严格按意图项目身份匹配**（兄弟项目的实例不会被选中），
+  找到后写入发现缓存；扫描探测带 2.5s 短超时，不会卡死在无响应的僵尸实例上
 
 ## 卸载
 
