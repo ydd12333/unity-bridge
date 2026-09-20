@@ -649,6 +649,9 @@ const UNITY_BRIDGE_CHEATSHEET = `# Unity Bridge 工具速查表
 本插件提供两类 Unity 编辑器工具：
 - 精选工具（unity_health/compile/refresh/logs/execute/scene_open/asset_get）：已做参数约束与编译轮询。
 - 透传工具 unity_mcp：调用 Unity 内 MCP for Unity 包的任意工具。先用 unity_mcp_catalog 查清单，再传 { tool, params }。
+  该包是**可选依赖**（UPM 不允许包间 git 依赖，故 Unity Bridge 不声明它，改为运行时反射探测）：
+  项目没装时 unity_health.mcpInstalled == false、unity_mcp_catalog 返回 { installed:false, hint:安装方法 }、
+  unity_mcp 直接报错并附安装指引——这不是故障，按需装或不装都可以（不装时用精选工具即可）。
 
 常用映射（tool → action，params 里先传 action 再传其余参数）：
 - 场景 manage_scene：get_active / load / save / create / get_hierarchy / get_build_settings / screenshot / close_scene / set_active_scene / get_loaded_scenes / move_to_scene / modify_build_settings
@@ -709,12 +712,20 @@ export function apply(ctx) {
 
 要点：把 \`com.yd.unitybridge\`（git URL \`https://github.com/ydd12333/unity-bridge.git?path=/com.yd.unitybridge\`）
 加入目标项目 \`Packages/manifest.json\` 的 \`dependencies\`，等 Unity 解析编译后
-服务自动启动（127.0.0.1:8321）。详见 Install.md。`,
+服务自动启动（127.0.0.1:8321）。详见 Install.md。
+
+注意（本包 ≥1.1.0 已修复）：UPM 不支持「包与包之间的 git 依赖」，因此该 UPM 包不再声明
+MCP for Unity。若 Package Manager 报 \`Package com.yd.unitybridge@... has invalid dependencies ...
+Version 'https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main' is invalid. Expected a
+'SemVer' compatible value.\`，说明项目里解析到的还是旧版包：删掉 manifest 里的
+\`com.yd.unitybridge\`（必要时清理 \`<项目>/Library/PackageCache/com.yd.unitybridge@*\`）后重新添加即可。
+需要 unity_mcp 透传工具时，把 \`com.coplaydev.unity-mcp\` 的 git 地址加进**项目** manifest
+（同样不能写进包内 package.json）。`,
     })
   }
 
   register(ctx, 'unity_health',
-    '查询 Unity 编辑器状态（是否正在编译/刷新、项目名、Unity 版本、监听端口、项目路径）。',
+    '查询 Unity 编辑器状态（是否正在编译/刷新、项目名、Unity 版本、监听端口、项目路径，以及可选依赖 MCP for Unity 是否已装：mcpInstalled / mcpVersion）。',
     {},
     (_args, exec) => healthChecked(exec))
 
@@ -803,12 +814,12 @@ export function apply(ctx) {
     (args, exec) => call(exec, 'POST', '/asset/get', { path: args.path, guid: args.guid }))
 
   register(ctx, 'unity_mcp_catalog',
-    '列出当前 Unity 实例可用的 MCP for Unity 工具清单（名称、类型、描述、分组），用于确定某个操作该调用哪个工具。',
+    '列出当前 Unity 实例可用的 MCP for Unity 工具清单（名称、类型、描述、分组与参数），用于确定某个操作该调用哪个工具。需要目标项目安装可选依赖 com.coplaydev.unity-mcp；未安装时返回 { installed:false, count:0, hint:安装方法 }。',
     {},
     (_args, exec) => call(exec, 'GET', '/mcp/catalog'))
 
   register(ctx, 'unity_mcp',
-    '透传调用 Unity 编辑器内 MCP for Unity 包的任意工具（约 30 个，覆盖资源/场景/GameObject/组件/脚本/构建/测试/材质/UI/包管理等）。先调用 unity_mcp_catalog 获取可用工具清单，再指定 tool 与对应 params 执行。工具的业务失败（参数缺省/资源不存在/动作不支持）会抛错返回，不再返回 success:false 让调用方自行解析。',
+    '透传调用 Unity 编辑器内 MCP for Unity 包的任意工具（约 30 个，覆盖资源/场景/GameObject/组件/脚本/构建/测试/材质/UI/包管理等）。需要目标项目安装可选依赖 com.coplaydev.unity-mcp：未安装时本工具报错并附安装指引，此时改用 unity_compile/unity_logs/unity_execute 等精选工具。先调用 unity_mcp_catalog 获取可用工具清单，再指定 tool 与对应 params 执行。工具的业务失败（参数缺省/资源不存在/动作不支持）会抛错返回，不再返回 success:false 让调用方自行解析。',
     {
       tool: { type: 'string', required: true, description: 'MCP 工具名（如 manage_scene、manage_asset、manage_gameobject、manage_script、manage_build、run_tests 等），见 unity_mcp_catalog。' },
       params: { type: 'object', description: '传给该工具的参数字典（含 action 子操作名与具体参数）。' },

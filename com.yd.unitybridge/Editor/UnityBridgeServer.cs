@@ -35,7 +35,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using MCPForUnity.Editor.Tools;
 using UnityEditor;
 using UnityEditor.Compilation;
 using UnityEditor.SceneManagement;
@@ -407,7 +406,7 @@ namespace UnityBridge
                 case "/scene/open": return RunOnMain(() => DoOpenScene(args));
                 case "/asset/get":  return RunOnMain(() => DoGetAsset(args));
                 case "/mcp":        return RunMcp(args);
-                case "/mcp/catalog": return RunOnMain(() => GetMcpCatalog());
+                case "/mcp/catalog": return RunOnMain(() => McpForUnityBridge.BuildCatalog());
                 default:            throw new Exception($"unknown endpoint: {path}");
             }
         }
@@ -519,6 +518,10 @@ namespace UnityBridge
                 // 进程标识与启动时间：多实例场景下帮助 DSH 侧区分连的是哪个 Unity 实例。
                 pid = System.Diagnostics.Process.GetCurrentProcess().Id,
                 startTimeUtc = StartTimeUtc,
+                // MCP for Unity（com.coplaydev.unity-mcp）是可选依赖：未安装时
+                // /health 仍正常，仅 mcpInstalled=false（/mcp 等端点会给出安装提示）。
+                mcpInstalled = McpForUnityBridge.IsInstalled,
+                mcpVersion = McpForUnityBridge.Version,
             };
         }
 
@@ -763,8 +766,10 @@ namespace UnityBridge
         //
         // 复用项目已安装的 com.coplaydev.unity-mcp 包的全部编辑器工具（约 30 个，
         // 覆盖资源/场景/GameObject/组件/脚本/构建/测试/材质/UI/包管理等）。
-        // 不复制其代码，直接调用其 CommandRegistry（public static）统一路由，
-        // 随包升级自动获得新工具。
+        // 该包是**可选依赖**：UPM 不支持包与包之间的 git 依赖（Git URL 只能写在
+        // 项目的 Packages/manifest.json），因此本包不声明它，改由
+        // McpForUnityBridge 运行时反射探测并调用其 CommandRegistry 统一路由，
+        // 随 MCP 升级自动获得新工具；未安装时相关端点返回明确的安装提示。
 
         // /mcp：执行任意 MCP 工具。body = { tool, params: {...} }。
         private static async Task<object> RunMcp(JObject args)
@@ -772,6 +777,9 @@ namespace UnityBridge
             var tool = args["tool"]?.Value<string>();
             if (string.IsNullOrWhiteSpace(tool))
                 throw new Exception("mcp 需要 tool");
+
+            if (!McpForUnityBridge.IsInstalled)
+                throw new Exception(McpForUnityBridge.InstallHint);
 
             var parameters = args["params"] as JObject ?? new JObject();
 
@@ -791,13 +799,13 @@ namespace UnityBridge
                 throw new Exception($"MCP 工具 {tool} 执行失败: {inner.Message}", inner);
             }
 
-            return NormalizeMcpResult(tool, result);
+            return McpForUnityBridge.NormalizeResult(tool, result);
         }
 
         // 在主线程启动 InvokeCommandAsync 并返回其 Task；不 await，避免阻塞主线程。
         private static Task<object> StartMcpInvoke(string tool, JObject parameters)
         {
-            return CommandRegistry.InvokeCommandAsync(tool, parameters);
+            return McpForUnityBridge.InvokeCommandAsync(tool, parameters);
         }
 
         // 在主线程调度一个返回 Task 的工厂，通过 TCS 桥接给 HTTP 线程 await。
@@ -809,129 +817,6 @@ namespace UnityBridge
             // 主线程完全卡死（Modal/长任务）时仍会兜底报错而非无限等。
             _ = ScheduleTimeout(item, 30000, "MCP 调用无法在主线程启动");
             return item.Completion.Task;
-        }
-
-        private static object NormalizeMcpResult(string tool, object result)
-        {
-            // 统一响应形状：{ success, data } 或 { success, error }。
-            if (result == null)
-            {
-                return new { success = true, tool, data = (object)null };
-            }
-
-            // SuccessResponse / ErrorResponse 是 MCPForUnity.Editor.Helpers 的 public 类型。
-            if (result is MCPForUnity.Editor.Helpers.SuccessResponse sr)
-            {
-                return new { success = true, tool, message = sr.Message, data = sr.Data };
-            }
-            if (result is MCPForUnity.Editor.Helpers.ErrorResponse er)
-            {
-                return new { success = false, tool, error = er.Error, code = er.Code, data = er.Data };
-            }
-            if (result is MCPForUnity.Editor.Helpers.PendingResponse pr)
-            {
-                return new { success = true, tool, pending = true, message = pr.Message, data = pr.Data };
-            }
-
-            // 兜底：其它返回类型直接透传（由 Newtonsoft 序列化）。
-            return new { success = true, tool, data = result };
-        }
-
-        // /mcp/catalog：复用 MCP 包的 ToolDiscoveryService（MCPServiceLocator）枚举全部工具，
-        // 返回完整元数据：名称、描述（含 "Tool: xxx" 回退）、分组、以及每个参数的
-        // 名称/类型/是否必填/默认值——解决「catalog 描述全 null、AI 只能靠试错猜参数」的问题。
-        // 注意：该服务在首次调用时反射全程序集，可能耗时数百 ms，属一次性成本（有缓存）。
-        private static object GetMcpCatalog()
-        {
-            List<MCPForUnity.Editor.Services.ToolMetadata> tools;
-            try
-            {
-                tools = MCPForUnity.Editor.Services.MCPServiceLocator.ToolDiscovery.DiscoverAllTools();
-            }
-            catch (Exception ex)
-            {
-                // 防御：MCP 包版本差异导致找不到服务时，回退到轻量反射（名称+分组，无参数）。
-                return new
-                {
-                    count = -1,
-                    fallback = true,
-                    error = ex.Message,
-                    tools = GetMcpCatalogLight(),
-                };
-            }
-
-            return new
-            {
-                count = tools?.Count ?? 0,
-                tools = (tools ?? new List<MCPForUnity.Editor.Services.ToolMetadata>())
-                    .OrderBy(t => t.Name)
-                    .Select(t => new
-                    {
-                        tool = t.Name,
-                        description = string.IsNullOrEmpty(t.Description) ? $"Tool: {t.Name}" : t.Description,
-                        group = t.Group,
-                        structuredOutput = t.StructuredOutput,
-                        requiresPolling = t.RequiresPolling,
-                        pollAction = t.PollAction,
-                        parameters = (t.Parameters ?? new List<MCPForUnity.Editor.Services.ParameterMetadata>())
-                            .OrderByDescending(p => p.Required)
-                            .ThenBy(p => p.Name)
-                            .Select(p => new
-                            {
-                                name = p.Name,
-                                type = p.Type,
-                                required = p.Required,
-                                description = p.Description,
-                                defaultValue = p.DefaultValue,
-                            }).ToList(),
-                    }).ToList(),
-            };
-        }
-
-        // 轻量回退：仅反射 attribute（名称 + 类型 + 分组），无参数信息。
-        private static List<object> GetMcpCatalogLight()
-        {
-            var list = new List<object>();
-            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                Type[] types;
-                try { types = assembly.GetTypes(); }
-                catch { continue; }
-
-                foreach (var type in types)
-                {
-                    var attr = type.GetCustomAttribute<McpForUnityToolAttribute>();
-                    if (attr == null) continue;
-
-                    list.Add(new
-                    {
-                        tool = string.IsNullOrEmpty(attr.Name) ? ToSnakeCase(type.Name) : attr.Name,
-                        type = type.FullName,
-                        description = attr.Description,
-                        group = attr.Group,
-                    });
-                }
-            }
-            return list;
-        }
-
-        private static string ToSnakeCase(string name)
-        {
-            var sb = new StringBuilder();
-            for (var i = 0; i < name.Length; i++)
-            {
-                var c = name[i];
-                if (char.IsUpper(c))
-                {
-                    if (i > 0) sb.Append('_');
-                    sb.Append(char.ToLowerInvariant(c));
-                }
-                else
-                {
-                    sb.Append(c);
-                }
-            }
-            return sb.ToString();
         }
 
         // ── 写保护（WriteGuard 简化版，借鉴团结 AI CodelyBridge）──

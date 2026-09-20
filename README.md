@@ -3,7 +3,7 @@
 让 **DeepSeek Harness（DSH）** 或任意 HTTP 客户端控制本机 Unity 编辑器。
 
 - 常驻本地 HTTP 服务 `127.0.0.1:8321`（端口占用自动顺延，实际端口写入 `<项目>/Library/UnityBridgePort.txt` 供动态发现）
-- 提供 `unity_*` 工具：编译、刷新资产、读日志/编译错误、执行编辑器方法、打开场景、查询资源，并透传 **MCP for Unity** 全部工具
+- 提供 `unity_*` 工具：编译、刷新资产、读日志/编译错误、执行编辑器方法、打开场景、查询资源；项目若另外装了 **MCP for Unity**，还会自动启用其全部工具的透传调用（`unity_mcp` / `unity_mcp_catalog`）
 - 两部分组成：
   - **DSH 侧**：npm 插件包（`unity-bridge`，`dsh plugin` / pnpm 安装，host 全局插件，任何会话可用）
   - **Unity 侧**：UPM 包 `com.yd.unitybridge`（编辑器脚本，git URL 安装）
@@ -51,7 +51,19 @@ dsh plugin --profile web add .
 
 或在 Unity 中 **Window → Package Manager → + → Add package from git URL…** 粘贴上述 URL。
 
-> 也可让 AI 按 [Install.md](Install.md) 自动完成。UPM 包自动依赖 `com.coplaydev.unity-mcp` 与 `com.unity.nuget.newtonsoft-json`。
+> 也可让 AI 按 [Install.md](Install.md) 自动完成。UPM 包唯一依赖是注册表包
+> `com.unity.nuget.newtonsoft-json`。
+
+**MCP for Unity（`com.coplaydev.unity-mcp`）是可选依赖**：UPM 不支持包与包之间的
+git 依赖（Git URL 只能写在项目 manifest），所以本包不声明它，改为运行时反射探测。
+需要 `unity_mcp` 透传工具时，把这个 git 地址加进**项目 manifest 的 `dependencies`**：
+
+```json
+"com.coplaydev.unity-mcp": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main"
+```
+
+装上后 `unity_health` 的 `mcpInstalled` 为 `true`（`mcpVersion` 为版本）；
+没装也能正常使用其余全部功能，只是 `unity_mcp` 会提示安装方法。
 
 ### 3. 验证
 
