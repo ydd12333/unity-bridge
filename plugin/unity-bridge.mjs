@@ -664,6 +664,8 @@ async function codelyStatus(exec, { probe = true } = {}) {
     envPort: process.env.UNITY_BRIDGE_CODELY_PORT,
     envHost: process.env.UNITY_BRIDGE_CODELY_HOST,
   })
+  const lastUpdated = target.registry ? target.registry.lastUpdated : ''
+  const parsedUpdated = lastUpdated ? Date.parse(lastUpdated) : NaN
   const info = {
     installed: true,
     host: target.host,
@@ -672,10 +674,12 @@ async function codelyStatus(exec, { probe = true } = {}) {
     heartbeat: target.registry ? target.registry.file : null,
     heartbeatReloading: target.registry ? target.registry.reloading : null,
     heartbeatReason: target.registry ? target.registry.reason : '',
-    heartbeatLastUpdated: target.registry ? target.registry.lastUpdated : '',
+    heartbeatLastUpdated: lastUpdated,
+    // 心跳文件只在状态变化时重写，因此 age 大 ≠ 实例已死（是否存活以 ping 为准）。
+    heartbeatAgeSeconds: Number.isNaN(parsedUpdated) ? null : Math.max(0, Math.round((Date.now() - parsedUpdated) / 1000)),
     viaEnvPort: target.viaEnvPort === true,
   }
-  if (!probe) return { ...info, info }
+  if (!probe) return info
 
   const pinged = await codelyCall('ping', {}, { cwd, target, timeoutMs: 8000 })
   return { ...info, serverVersion: pinged.serverVersion, alive: true }
@@ -695,7 +699,8 @@ function registerCodelyTools(ctx) {
       let customTools = null
       try {
         const res = await codelyCall('get_custom_tools', {}, { cwd: sessionCwd(exec), timeoutMs: 15000 })
-        customTools = res.response?.data ?? res.response
+        const raw = res.response
+        customTools = raw && raw.data && raw.data.data !== undefined ? raw.data.data : raw && raw.data !== undefined ? raw.data : raw
       } catch (err) {
         customTools = { error: String(err && err.message) }
       }
@@ -703,7 +708,7 @@ function registerCodelyTools(ctx) {
     })
 
   register(ctx, 'codely_call',
-    '透传调用 Codely Bridge（cn.tuanjie.codely.bridge）的任意命令：改预制体/资源（manage_asset modify）、场景与 GameObject（manage_gameobject/manage_scene）、脚本（manage_script）、编辑器状态与播放模式（manage_editor）、任意 C# 脚本（execute_csharp_script）、模拟输入（manage_input）、截图（manage_screenshot）等。先用 codely_catalog 查 tool/action。不依赖 MCP，也不依赖本仓库的 UPM 包是否编译通过。',
+    '透传调用 Codely Bridge（cn.tuanjie.codely.bridge）的任意命令：改预制体/资源（manage_asset modify）、场景与 GameObject（manage_gameobject/manage_scene）、脚本（manage_script）、编辑器状态与播放模式（manage_editor）、任意 C# 脚本（execute_csharp_script，参数名 script）、模拟输入（manage_input）、截图（manage_screenshot）等。先用 codely_catalog 查 tool/action。不依赖 MCP，也不依赖本仓库的 UPM 包是否编译通过。响应已展平：业务结果在 data，handler 的额外字段（如 manage_editor 的 state）平铺在同级；业务失败直接抛错。',
     {
       tool: { type: 'string', required: true, description: 'Codely 命令名，如 manage_asset、manage_gameobject、manage_scene、manage_editor、execute_csharp_script。' },
       params: { type: 'object', description: '命令参数，通常含 action（如 {"action":"get_info","path":"Assets/X.prefab"}）。' },
@@ -713,9 +718,26 @@ function registerCodelyTools(ctx) {
       const timeoutMs = Number.isInteger(args.timeout_ms) && args.timeout_ms > 0 ? args.timeout_ms : 120000
       const res = await codelyCall(args.tool, args.params ?? {}, { cwd: sessionCwd(exec), timeoutMs })
       const body = res.response
-      if (body && body.success === false) {
-        const detail = body.message || body.error || 'unknown error'
-        throw new Error(`Codely 命令 ${args.tool} 执行失败: ${detail}${body.data ? ` | data=${JSON.stringify(body.data)}` : ''}`)
+      // Codely 的响应有两层：外层是路由结果（{success,message,data}），内层是工具
+      // handler 自己的 Response（同为 {success,message,data}）。业务失败（参数缺失/
+      // 资源不存在/动作不支持）只体现在内层 success:false（如 "'script' parameter is
+      // required."），因此两层都要判定，并按本仓库约定统一抛错。
+      const inner = body && body.data && typeof body.data === 'object' && !Array.isArray(body.data) ? body.data : null
+      const failed = (body && body.success === false) || (inner && inner.success === false)
+      if (failed) {
+        const src = inner && inner.success === false ? inner : body
+        const detail = src.message || src.error || src.code || 'unknown error'
+        throw new Error(`Codely 命令 ${args.tool} 执行失败: ${detail}${src.data ? ` | data=${JSON.stringify(src.data)}` : ''}`)
+      }
+      // 展平：有内层就返回内层的 message/data，避免调用方看到两层嵌套；
+      // handler 响应里 success/message/data 之外的字段（如 manage_editor 的
+      // state、manage_job 的 job_id 等）平铺到同级，保证不丢信息。
+      const reserved = new Set(['ok', 'tool', 'port', 'projectRoot', 'serverVersion', 'message', 'data'])
+      const extras = {}
+      if (inner) {
+        for (const [key, value] of Object.entries(inner)) {
+          if (!reserved.has(key) && key !== 'success') extras[key] = value
+        }
       }
       return {
         ok: true,
@@ -723,8 +745,9 @@ function registerCodelyTools(ctx) {
         port: res.port,
         projectRoot: res.projectRoot,
         serverVersion: res.serverVersion,
-        message: body && body.message,
-        data: body ? body.data : res.raw,
+        message: inner ? inner.message : body && body.message,
+        data: inner ? (inner.data !== undefined ? inner.data : inner) : (body ? body.data : res.raw),
+        ...extras,
       }
     }, 300000)
 }

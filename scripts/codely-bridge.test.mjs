@@ -58,15 +58,30 @@ console.log('\n—— codely_catalog ——')
 const catalog = await run('codely_catalog', {}, PROJECT)
 check('含命令目录文本', typeof catalog.catalog === 'string' && catalog.catalog.includes('manage_asset'))
 check('含自定义工具查询结果', catalog.customTools !== undefined)
+check('catalog 不再重复 info 字段', catalog.info === undefined)
 
 // —— 4. 透传调用（只读，安全）——
+// 输出已展平：外层路由响应的内层 handler 响应被拆开，业务失败直接抛错。
 console.log('\n—— codely_call（只读）——')
 const state = await run('codely_call', { tool: 'manage_editor', params: { action: 'get_state' } }, PROJECT)
-check('manage_editor/get_state ok', state.ok === true && state.data?.state?.editor !== undefined, JSON.stringify(state).slice(0, 300))
+check('manage_editor/get_state ok', state.ok === true && state.data?.isPlaying === false, JSON.stringify(state).slice(0, 300))
+check('manage_editor 的 state 字段被平铺保留', state.state?.editor?.playMode === 'stopped', JSON.stringify(state.state || {}).slice(0, 200))
 const comps = await run('codely_call', { tool: 'manage_asset', params: { action: 'get_components', path: PREFAB } }, PROJECT)
-check('manage_asset/get_components 读到预制体组件', Array.isArray(comps.data?.data) && comps.data.data.length > 0, JSON.stringify(comps).slice(0, 300))
+check('manage_asset/get_components 读到预制体组件', Array.isArray(comps.data) && comps.data.length > 0, JSON.stringify(comps).slice(0, 300))
 const info = await run('codely_call', { tool: 'manage_asset', params: { action: 'get_info', path: PREFAB } }, PROJECT)
-check('manage_asset/get_info 返回 guid', typeof info.data?.data?.guid === 'string', JSON.stringify(info).slice(0, 200))
+check('manage_asset/get_info 返回 guid', typeof info.data?.guid === 'string', JSON.stringify(info).slice(0, 200))
+
+// 内置 Roslyn：真正执行一段 C#（只读表达式）
+const csharp = await run('codely_call', { tool: 'execute_csharp_script', params: { action: 'editor', script: 'return Application.dataPath;' } }, PROJECT)
+const csharpText = JSON.stringify(csharp)
+check('execute_csharp_script 实跑成功', csharp.ok === true && csharpText.includes('islandclient'), csharpText.slice(0, 300))
+
+// 业务失败必须抛错（不是 ok:true + 嵌套 success:false）
+let businessError = ''
+try {
+  await tools.get('codely_call').execute({ tool: 'execute_csharp_script', params: { action: 'editor' } }, execWith(PROJECT))
+} catch (e) { businessError = e.message }
+check('业务失败抛错并带原始信息', businessError.includes("'script' parameter is required"), businessError.slice(0, 200))
 
 // —— 5. 错误路径 ——
 console.log('\n—— 错误路径 ——')
