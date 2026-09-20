@@ -1,11 +1,14 @@
 // 作者: ydd12333
 //
 // DSH 侧 Unity Bridge 客户端插件（host 全局插件，npm 包 main 入口）。
-// 由真实 Node ESM 加载（非动态 Cordis 沙箱），因此可用 node:http 与 Unity
-// 侧的本地 HTTP 服务通信。注册 9 个模型可调用的工具：
+// 由真实 Node ESM 加载（非动态 Cordis 沙箱），因此可用 node:http / node:net 与
+// Unity 侧的本地服务通信。注册 12 个模型可调用的工具：
 //   unity_health / unity_compile / unity_refresh / unity_logs /
 //   unity_execute / unity_scene_open / unity_asset_get /
 //   unity_mcp_catalog / unity_mcp
+//   codely_health / codely_catalog / codely_call
+// （codely_* = 透传第三方 cn.tuanjie.codely.bridge 的原生 TCP 命令，与本仓库的
+//  UPM 包、与 MCP for Unity 都无关；实现在 plugin/codely-client.mjs。）
 //
 // 安装（推荐）：把本仓库作为 DSH 插件包一键安装——
 //   cd unity-bridge 仓库目录
@@ -29,6 +32,13 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  codelyCall,
+  codelyCatalogText,
+  codelyRegistryPath,
+  discoverCodely,
+  readCodelyRegistry,
+} from './codely-client.mjs'
 
 const HOST = '127.0.0.1'
 const DEFAULT_PORT = 8321
@@ -639,6 +649,86 @@ function register(ctx, name, description, props, execute, timeoutMs) {
   })
 }
 
+// ── Codely Bridge 工具（第三方编辑器自动化后端，不依赖 MCP）─────────────────
+//
+// cn.tuanjie.codely.bridge（团结 AI / Codely Bridge）自带一整套编辑器工具，走原生
+// TCP + 内置 Roslyn，与本仓库的 UPM 包、与 MCP for Unity 都无关；它的原生服务不依赖
+// 域重载，因此即使项目当前编译报错（我们的 unity_* 起不来）它照样在线。
+// 这里只做“转发”：用 plugin/codely-client.mjs 连接并执行命令。
+
+// 汇总一次调用所需的实例信息（心跳 + 一次真实 ping 探活）。
+async function codelyStatus(exec, { probe = true } = {}) {
+  const cwd = sessionCwd(exec)
+  const target = discoverCodely(cwd, {
+    envProject: process.env.UNITY_BRIDGE_PROJECT,
+    envPort: process.env.UNITY_BRIDGE_CODELY_PORT,
+    envHost: process.env.UNITY_BRIDGE_CODELY_HOST,
+  })
+  const info = {
+    installed: true,
+    host: target.host,
+    port: target.port,
+    projectRoot: target.rawRoot || target.projectRoot,
+    heartbeat: target.registry ? target.registry.file : null,
+    heartbeatReloading: target.registry ? target.registry.reloading : null,
+    heartbeatReason: target.registry ? target.registry.reason : '',
+    heartbeatLastUpdated: target.registry ? target.registry.lastUpdated : '',
+    viaEnvPort: target.viaEnvPort === true,
+  }
+  if (!probe) return { ...info, info }
+
+  const pinged = await codelyCall('ping', {}, { cwd, target, timeoutMs: 8000 })
+  return { ...info, serverVersion: pinged.serverVersion, alive: true }
+}
+
+function registerCodelyTools(ctx) {
+  register(ctx, 'codely_health',
+    '查询 Codely Bridge（cn.tuanjie.codely.bridge，团结 AI 的编辑器自动化桥）是否可用：从 <项目根>/Temp/.com-unity-codely.json 发现端口，握手并 ping 探活，返回项目根、端口、SERVER_VERSION 与心跳状态。可用时才能调用 codely_call / codely_catalog。',
+    {},
+    async (_args, exec) => codelyStatus(exec))
+
+  register(ctx, 'codely_catalog',
+    '列出 Codely Bridge 的命令与常用 action（manage_gameobject/manage_asset/manage_scene/manage_script/manage_editor/execute_csharp_script/manage_input/manage_screenshot 等），并附带目标项目自定义工具清单。用于确定 codely_call 该传什么 tool/action。',
+    {},
+    async (_args, exec) => {
+      const status = await codelyStatus(exec, { probe: false })
+      let customTools = null
+      try {
+        const res = await codelyCall('get_custom_tools', {}, { cwd: sessionCwd(exec), timeoutMs: 15000 })
+        customTools = res.response?.data ?? res.response
+      } catch (err) {
+        customTools = { error: String(err && err.message) }
+      }
+      return { ...status, catalog: codelyCatalogText(), customTools }
+    })
+
+  register(ctx, 'codely_call',
+    '透传调用 Codely Bridge（cn.tuanjie.codely.bridge）的任意命令：改预制体/资源（manage_asset modify）、场景与 GameObject（manage_gameobject/manage_scene）、脚本（manage_script）、编辑器状态与播放模式（manage_editor）、任意 C# 脚本（execute_csharp_script）、模拟输入（manage_input）、截图（manage_screenshot）等。先用 codely_catalog 查 tool/action。不依赖 MCP，也不依赖本仓库的 UPM 包是否编译通过。',
+    {
+      tool: { type: 'string', required: true, description: 'Codely 命令名，如 manage_asset、manage_gameobject、manage_scene、manage_editor、execute_csharp_script。' },
+      params: { type: 'object', description: '命令参数，通常含 action（如 {"action":"get_info","path":"Assets/X.prefab"}）。' },
+      timeout_ms: { type: 'integer', description: '超时毫秒，默认 120000；构建/烘焙/录屏等长任务可调大。' },
+    },
+    async (args, exec) => {
+      const timeoutMs = Number.isInteger(args.timeout_ms) && args.timeout_ms > 0 ? args.timeout_ms : 120000
+      const res = await codelyCall(args.tool, args.params ?? {}, { cwd: sessionCwd(exec), timeoutMs })
+      const body = res.response
+      if (body && body.success === false) {
+        const detail = body.message || body.error || 'unknown error'
+        throw new Error(`Codely 命令 ${args.tool} 执行失败: ${detail}${body.data ? ` | data=${JSON.stringify(body.data)}` : ''}`)
+      }
+      return {
+        ok: true,
+        tool: args.tool,
+        port: res.port,
+        projectRoot: res.projectRoot,
+        serverVersion: res.serverVersion,
+        message: body && body.message,
+        data: body ? body.data : res.raw,
+      }
+    }, 300000)
+}
+
 // ── Unity Bridge 工具速查表 ────────────────────────────────────────────────
 //
 // 通过 systemPrompt section 注入，帮助模型高效调用 unity_mcp 透传工具。
@@ -695,6 +785,13 @@ export function apply(ctx) {
     name: 'unity-bridge-tools',
     order: 150,
     text: UNITY_BRIDGE_CHEATSHEET,
+  })
+
+  // Codely Bridge 是另一条独立通道（第三方编辑器自动化后端），单独一节说明何时用它。
+  ctx.systemPrompt.section({
+    name: 'unity-bridge-codely',
+    order: 148,
+    text: CODELY_CHEATSHEET,
   })
 
   // 把 Unity 侧安装指南的位置告诉 AI：安装插件 ≠ 已能连上 Unity，
@@ -837,7 +934,36 @@ Version 'https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main' is i
       }
       return data
     })
+
+  registerCodelyTools(ctx)
 }
+
+// ── Codely Bridge 速查表（systemPrompt 注入）──────────────────────────────
+//
+// 说明什么时候该用 codely_*：它们是第三方编辑器自动化后端（团结 AI Codely Bridge）的
+// 透传通道，覆盖预制体/资源/场景/脚本/输入/截图/任意 C#，且不依赖 MCP 与本仓库 UPM 包。
+
+const CODELY_CHEATSHEET = `# Codely Bridge 工具（可选的第三方后端）
+
+目标项目若安装了 cn.tuanjie.codely.bridge（团结 AI 的编辑器自动化桥），可用这三个工具
+直接驱动它——它自带工具层与 Roslyn，**不依赖 MCP，也不依赖本仓库的 UPM 包是否在运行**：
+
+- codely_health：发现并探活（读 <项目根>/Temp/.com-unity-codely.json + 握手 ping）。
+- codely_catalog：列出命令与常用 action（含项目自定义工具）。
+- codely_call：{ tool, params } 透传执行，params 通常含 action。
+
+什么时候优先用它：
+- 改**预制体**：codely_call manage_asset { action:"modify", path:"Assets/.../X.prefab", properties:{...} }
+  （改组件后内部会 PrefabUtility.SavePrefabAsset 落盘）；查结构用 action:"get_info" / "get_components"。
+- 改场景对象/层级/组件：manage_gameobject（create/modify/add_component/set_component_property/…，
+  查找用 searchMethod=by_name|by_path|by_id|by_tag|by_layer|by_component + target）。
+- 需要“任意编辑器操作”而现有端点都不够时：execute_csharp_script（action:"editor" 或 "play"，
+  内置 Roslyn，直接编译执行 C#）。
+- 主线程被模态框卡死时：manage_dialog { action:"click" } 与 manage_job 在后台线程执行，仍可用。
+- 模拟输入/截图：manage_input、manage_screenshot。
+
+注意：unity_* 走本仓库的 UPM 包（HTTP 8321）；codely_* 走 Codely 的原生 TCP 端口。
+两者互不替代，按目标项目实际装了哪个来选；项目没装 Codely Bridge 时 codely_health 会报“未检测到”。`
 
 // 内部逻辑导出：仅供仓库自测/调试（scripts/ 下的测试脚本与故障复现用），
 // DSH 运行时只消费 apply/name/inject，额外的具名导出无副作用。
@@ -855,4 +981,9 @@ export const _internals = {
   sessionCwd,
   portForExec,
   findPortByHealth,
+  // Codely 侧（自测用；运行时不依赖这些导出）
+  discoverCodely,
+  readCodelyRegistry,
+  codelyRegistryPath,
+  codelyCall,
 }

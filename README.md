@@ -73,9 +73,40 @@ git 依赖（Git URL 只能写在项目 manifest），所以本包不声明它�
 
 ## 使用
 
-工具：`unity_health` / `unity_compile` / `unity_refresh` / `unity_logs` / `unity_execute` / `unity_scene_open` / `unity_asset_get` / `unity_mcp_catalog` / `unity_mcp`
+工具（12 个）：
 
-端口规则（多编辑器 / 多会话自动路由）：
+- 走**本仓库 UPM 包**（HTTP `127.0.0.1:8321`）：`unity_health` / `unity_compile` / `unity_refresh` / `unity_logs` / `unity_execute` / `unity_scene_open` / `unity_asset_get` / `unity_mcp_catalog` / `unity_mcp`
+- 走**第三方 Codely Bridge**（原生 TCP，团结 AI `cn.tuanjie.codely.bridge`，可选）：`codely_health` / `codely_catalog` / `codely_call`
+
+### codely_* —— 不依赖 MCP 的编辑器自动化通道
+
+目标项目若装了 [Codely Bridge](https://www.tuanjie.cn/)（团结 AI 的编辑器自动化桥），本插件可直接驱动它：
+命令集覆盖 `manage_gameobject` / `manage_asset`（含预制体 `modify` + `PrefabUtility.SavePrefabAsset`）/
+`manage_scene` / `manage_script` / `manage_editor` / `manage_input` / `manage_screenshot` /
+`manage_package` / `manage_bake` / `manage_dialog` / `manage_job`，以及内置 Roslyn 的
+`execute_csharp_script`（**任意 C# 编辑器代码**）。它自带工具层与编译器，**既不依赖 MCP for Unity，
+也不依赖本仓库的 UPM 包**；其原生 TCP 服务不依赖域重载，所以项目当前编译报错时它依然在线。
+
+- 实例发现：读 `<项目根>/Temp/.com-unity-codely.json`（原生心跳文件，含 `unity_port` / `reloading` / `reason`）；
+  候选目录策略与本插件的端口文件一致（会话目录、逐级祖先、各祖先的同级目录）。
+- 协议：`WELCOME UNITY-TCP 1 FRAMING=1 SERVER_VERSION=n` 握手 → 帧 = `8 字节大端 uint64 长度 + UTF-8 负载`
+  → 命令 `{"type","params","request_id"}`（实现见 `plugin/codely-client.mjs`）。
+- 多实例/多项目同样按**会话工作目录**路由，歧义时拒绝自动选择；可用
+  `UNITY_BRIDGE_PROJECT` / `UNITY_BRIDGE_CODELY_PORT` / `UNITY_BRIDGE_CODELY_HOST` 覆盖。
+- 典型用法：
+  ```jsonc
+  // 读预制体
+  { "tool": "manage_asset", "params": { "action": "get_components", "path": "Assets/X.prefab" } }
+  // 改预制体（组件属性；内部会落盘保存）
+  { "tool": "manage_asset", "params": { "action": "modify", "path": "Assets/X.prefab", "properties": { "m_Name": "NewName" } } }
+  // 场景对象 / 任意 C#
+  { "tool": "manage_gameobject", "params": { "action": "set_component_property", "target": "Player", "searchMethod": "by_name", "componentType": "Rigidbody", "propertyName": "mass", "value": 5 } }
+  { "tool": "execute_csharp_script", "params": { "action": "editor", "code": "return Application.dataPath;" } }
+  ```
+- 自测：`node scripts/codely-bridge.test.mjs [项目根目录]`（对真实运行的编辑器跑 20 项断言）。
+- 独立 CLI：`node scripts/codely-client.mjs <项目根> manage_editor '{"action":"get_state"}'`。
+
+端口与路由规则（`unity_*`，多编辑器 / 多会话自动路由）：
 - 默认 `127.0.0.1:8321`，被占用自动顺延；实际端口写 `<项目>/Library/UnityBridgePort.txt`，
   另写 JSON 边车 `UnityBridgePort.json`（含 pid / 项目身份，供多实例场景校验"文件是谁写的"）
 - 每个 DSH 会话按其**工作目录**定位目标 Unity 实例（意图项目判定，多会话各连各的编辑器）：

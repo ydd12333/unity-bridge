@@ -1,7 +1,7 @@
 {
   "name": "unity-bridge",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness plugin: control a local Unity editor — compile, refresh assets, read console/compile logs, execute editor static methods, open scenes, query assets, and pass through all MCP for Unity tools.",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness plugin: control a local Unity editor — compile, refresh assets, read console/compile logs, execute editor static methods, open scenes, query assets, and pass through all MCP for Unity tools. Also drives the third-party Codely Bridge (cn.tuanjie.codely.bridge) over its native TCP protocol for prefab/scene/input/screenshot work and arbitrary C# scripting, independent of MCP.",
   "keywords": [
     "deepseek-harness",
     "dsh",
